@@ -1,15 +1,15 @@
 # Create a conversational agent with audio
 
-Often times robots are equipped with a speaker system and a microphone. Once these peripherals have been exposed through ROS, we can use EmbodiedAgents to trivially create a conversational interface on the robot. Our conversational agent will use a multimodal LLM for contextual question/answering utilizing the camera onboard the robot. Furthermore, it will use speech-to-text and text-to-speech models for converting audio to text and vice versa. We will start by importing the relavent components that we want to string together.
+Often times robots are equipped with a speaker system and a microphone. Once these peripherals have been exposed through ROS, we can use _EmbodiedAgents_ to trivially create a conversational interface on the robot. Our conversational agent will use a multimodal LLM for contextual question/answering utilizing the camera onboard the robot. Furthermore, it will use speech-to-text and text-to-speech models for converting audio to text and vice versa. We will start by importing the relavent components that we want to string together.
 
 ```python
 from agents.components import MLLM, SpeechToText, TextToSpeech
 ```
 
- [Components](../basics) are basic functional units in EmbodiedAgents. Their inputs and outputs are defined using ROS [Topics](../basics). And their function can be any input transformation, for example the inference of an ML model. Lets setup these components one by one. Since our input to the robot would be speech, we will setup the speech-to-text component first.
+ [Components](../basics/components) are basic functional units in _EmbodiedAgents_. Their inputs and outputs are defined using ROS [Topics](../basics/components.md#topic). And their function can be any input transformation, for example the inference of an ML model. Lets setup these components one by one. Since our input to the robot would be speech, we will setup the speech-to-text component first.
 
  ## SpeechToText Component
- This component listens to input an audio input topic, that takes in a multibyte array of audio (captured in a ROS std_msgs message, which maps to Audio msg_type in Sugarcoat) and can publish output to a text topic. It can also be configured to get the audio stream from microphones on board our robot. By default the component is configured to use a small Voice Activity Detection (VAD) model, [Silero-VAD](https://github.com/snakers4/silero-vad) to filter out any audio that is not speech.
+ This component listens to input an audio input topic, that takes in a multibyte array of audio (captured in a ROS std_msgs message, which maps to Audio msg_type in Sugarcoat🍬) and can publish output to a text topic. It can also be configured to get the audio stream from microphones on board our robot. By default the component is configured to use a small Voice Activity Detection (VAD) model, [Silero-VAD](https://github.com/snakers4/silero-vad) to filter out any audio that is not speech.
 
  However, merely utilizing speech can be problamatic in robots, due to the hands free nature of the audio system. Therefore its useful to add wakeword detection, so that speech-to-text is only activated when the robot is called with a specific phrase (e.g. 'Hey Jarvis').
 
@@ -69,7 +69,8 @@ speech_to_text = SpeechToText(
 The trigger parameter lets the component know that it has to perform its function (in this case model inference) when an input is received on this particular topic. In our configuration, the component will be triggered using voice activity detection on the continuous stream of audio being received on the microphone. Next we will setup our MLLM component.
 
 ## MLLM Component
-The MLLM component takes as input a text topic (the output of the SpeechToText component) and an image topic, assuming we have a camera device onboard the robot publishing this topic. And just like before we need to provide a model client, this time with an MLLM model. This time we will use the OllamaClient along with _llava:latest_ model, a popular opensource multimodal LLM available on Ollama.
+The MLLM component takes as input a text topic (the output of the SpeechToText component) and an image topic, assuming we have a camera device onboard the robot publishing this topic. And just like before we need to provide a model client, this time with an MLLM model. This time we will use the OllamaClient along with _llava:latest_ model, a popular opensource multimodal LLM available on Ollama. Furthermore, we will configure our MLLM component using `MLLMConfig`. We will set `stream=True` to make the MLLM output text, be published as a stream for downstream components that consume this output. In _EmbodiedAgents_, streaming can output can be chunked using a `break_character` in the config (Default: '.').This way the downstream TextToSpeech component can start generating audio as soon as the first sentence is produced by the LLM.
+
 
 ```{note}
 Ollama is one of the most popular local LLM serving projects. Learn about setting up Ollama [here](https://ollama.com).
@@ -79,6 +80,7 @@ Here is the code for our MLLM setup.
 ```python
 from agents.clients.ollama import OllamaClient
 from agents.models import OllamaModel
+from agents.config import MLLMConfig
 
 # Define the image input topic and a new text output topic
 image0 = Topic(name="image_raw", msg_type="Image")
@@ -88,6 +90,8 @@ text_answer = Topic(name="text1", msg_type="String")
 # OllamaModel is a generic wrapper for all ollama models
 llava = OllamaModel(name="llava", checkpoint="llava:latest")
 llava_client = OllamaClient(llava)
+
+mllm_config = MLLMConfig(stream=True)  # Other inference specific paramters can be provided here
 
 # Define an MLLM component
 mllm = MLLM(
@@ -120,8 +124,8 @@ In order to utilize _play_on_device_ you need to install a couple of dependencie
 from agents.config import TextToSpeechConfig
 from agents.models import SpeechT5
 
-# config for playing audio on device
-t2s_config = TextToSpeechConfig(play_on_device=True)
+# config for asynchronously playing audio on device
+t2s_config = TextToSpeechConfig(play_on_device=True, stream=True)
 
 speecht5 = SpeechT5(name="speecht5")
 roboml_speecht5 = RoboMLWSClient(speecht5)
@@ -153,7 +157,7 @@ Et voila! we have setup a graph of three components in less than 50 lines of wel
 :caption: Multimodal Audio Conversational Agent
 :linenos:
 from agents.components import MLLM, SpeechToText, TextToSpeech
-from agents.config import SpeechToTextConfig, TextToSpeechConfig
+from agents.config import SpeechToTextConfig, TextToSpeechConfig, MLLMConfig
 from agents.clients import OllamaClient, RoboMLWSClient
 from agents.models import Whisper, SpeechT5, OllamaModel
 from agents.ros import Topic, Launcher
@@ -182,17 +186,19 @@ text_answer = Topic(name="text1", msg_type="String")
 
 llava = OllamaModel(name="llava", checkpoint="llava:latest")
 llava_client = OllamaClient(llava)
+mllm_config = MLLMConfig(stream=True)  # Other inference specific paramters can be provided here
 
 mllm = MLLM(
     inputs=[text_query, image0],
     outputs=[text_answer],
     model_client=llava_client,
     trigger=text_query,
+    config=mllm_config,
     component_name="vqa",
 )
 
-# config for playing audio on device
-t2s_config = TextToSpeechConfig(play_on_device=True)
+# config for asynchronously playing audio on device
+t2s_config = TextToSpeechConfig(play_on_device=True, stream=True)
 
 speecht5 = SpeechT5(name="speecht5")
 roboml_speecht5 = RoboMLWSClient(speecht5)
@@ -213,7 +219,7 @@ launcher.bringup()
 
 ## Web Based Client for Interacting with the Robot
 
-To interact with text and audio based topics on the robot, EmbodiedAgents includes a tiny browser based client made with [chainlit](https://chainlit.io/). This is useful if the robot does not have a microphone/speaker interface or if one wants to communicate with it remotely. The client can be launched as follows:
+To interact with text and audio based topics on the robot, _EmbodiedAgents_ includes a tiny browser based client made with [chainlit](https://chainlit.io/). This is useful if the robot does not have a microphone/speaker interface or if one wants to communicate with it remotely. The client can be launched as follows:
 
 ```shell
 ros2 run automatika_embodied_agents tiny_web_client
