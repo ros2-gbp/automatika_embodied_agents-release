@@ -1,10 +1,11 @@
 """The following classes provide wrappers for data being transmitted via ROS topics. These classes form the inputs and outputs of [Components](agents.components.md)."""
 
-from typing import Union, Any, Dict, List
+from typing import Union, Any, Dict, List, Tuple
 import numpy as np
 from attrs import define, field, Factory
+from importlib.util import find_spec
 
-# FROM ROS_SUGAR
+# FROM SUGARCOAT
 from ros_sugar.supported_types import (
     add_additional_datatypes,
     SupportedType,
@@ -17,7 +18,7 @@ from ros_sugar.supported_types import (
     ROSImage,
     ROSCompressedImage,
 )
-from ros_sugar.io import Topic
+from ros_sugar.io import Topic as BaseTopic
 
 from ros_sugar.config import (
     BaseComponentConfig,
@@ -26,6 +27,7 @@ from ros_sugar.config import (
     base_validators,
 )
 from ros_sugar.core import BaseComponent
+from ros_sugar.core.component import MutuallyExclusiveCallbackGroup
 from ros_sugar import Launcher
 from ros_sugar.utils import component_action
 
@@ -35,8 +37,9 @@ from automatika_embodied_agents.msg import (
     Video as ROSVideo,
     Tracking as ROSTracking,
     Trackings as ROSTrackings,
+    PointsOfInterest as ROSPointsOfInterest,
 )
-from .callbacks import ObjectDetectionCallback, VideoCallback
+from .callbacks import ObjectDetectionCallback, RGBDCallback, VideoCallback
 
 __all__ = [
     "String",
@@ -56,6 +59,7 @@ __all__ = [
     "component_action",
     "MapLayer",
     "Route",
+    "MutuallyExclusiveCallbackGroup",
 ]
 
 
@@ -109,15 +113,19 @@ class Detection(SupportedType):
         boxes = []
         for bbox in output["bboxes"]:
             box = Bbox2D()
-            box.top_left_x = bbox[0]
-            box.top_left_y = bbox[1]
-            box.bottom_right_x = bbox[2]
-            box.bottom_right_y = bbox[3]
+            box.top_left_x = float(bbox[0])
+            box.top_left_y = float(bbox[1])
+            box.bottom_right_x = float(bbox[2])
+            box.bottom_right_y = float(bbox[3])
             boxes.append(box)
 
         msg.boxes = boxes
         if isinstance(img, ROSCompressedImage):
             msg.compressed_image = CompressedImage.convert(img)
+        # Handle RealSense RGBD msgs
+        elif hasattr(img, "depth"):
+            msg.image = Image.convert(img.rgb)
+            msg.depth = Image.convert(img.depth)
         else:
             msg.image = Image.convert(img)
         return msg
@@ -144,11 +152,49 @@ class Detections(SupportedType):
         return msg
 
 
+class PointsOfInterest(SupportedType):
+    """PointsOfInterest."""
+
+    _ros_type = ROSPointsOfInterest
+    callback = None  # not defined
+
+    @classmethod
+    def convert(
+        cls,
+        output: List[Tuple[int, int]],
+        img: Union[ROSImage, ROSCompressedImage, np.ndarray],
+        **_,
+    ) -> ROSPointsOfInterest:
+        """
+        Takes points of interest on an image and converts it into a ROS message
+        of type PointsOfInterest
+        :return: PointsOfInterest
+        """
+        msg = ROSPointsOfInterest()
+        points = []
+        for p in output:
+            point = Point2D()
+            point.x = float(p[0])
+            point.y = float(p[1])
+            points.append(point)
+        msg.points = points
+
+        if isinstance(img, ROSCompressedImage):
+            msg.compressed_image = CompressedImage.convert(img)
+        # Handle RealSense RGBD msgs
+        elif hasattr(img, "depth"):
+            msg.image = Image.convert(img.rgb)
+            msg.depth = Image.convert(img.depth)
+        else:
+            msg.image = Image.convert(img)
+        return msg
+
+
 class Tracking(SupportedType):
     """Tracking."""
 
     _ros_type = ROSTracking
-    callback = None  # Not defined in ROS Agents
+    callback = None  # Not defined in EmbodiedAgents
 
     @classmethod
     def convert(
@@ -193,6 +239,10 @@ class Tracking(SupportedType):
         msg.estimated_velocities = estimated_velocities
         if isinstance(img, ROSCompressedImage):
             msg.compressed_image = CompressedImage.convert(img)
+        # Handle RealSense RGBD msgs
+        elif hasattr(img, "depth"):
+            msg.image = Image.convert(img.rgb)
+            msg.depth = Image.convert(img.depth)
         else:
             msg.image = Image.convert(img)
         return msg
@@ -219,10 +269,56 @@ class Trackings(SupportedType):
         return msg
 
 
-agent_types = [Video, Detection, Detections, Tracking, Trackings]
+class RGBD(SupportedType):
+    """Adds callback for automatika_embodied_agents/msg/Detections2D message"""
+
+    callback = RGBDCallback
+
+    @classmethod
+    def get_ros_type(cls) -> type:
+        if find_spec("realsense2_camera_msgs") is None:
+            raise ModuleNotFoundError(
+                "'realsense2_camera_msgs' module is required to use 'RGBD' msg type but it is not installed"
+            )
+        from realsense2_camera_msgs.msg import RGBD as RealSenseRGBD
+
+        return RealSenseRGBD
+
+
+agent_types = [
+    Video,
+    Detection,
+    Detections,
+    Tracking,
+    Trackings,
+    RGBD,
+    PointsOfInterest,
+]
 
 
 add_additional_datatypes(agent_types)
+
+
+@define(kw_only=True)
+class Topic(BaseTopic):
+    """
+    A topic is an idomatic wrapper for a ROS2 topic, Topics can be given as inputs or outputs to components. When given as inputs, components automatically create listeners for the topics upon their activation. And when given as outputs, components create publishers for publishing to the topic.
+
+    :param name: Name of the topic
+    :type name: str
+    :param msg_type: One of the SupportedTypes. This parameter can be set by passing the SupportedType data-type name as a string. See a list of supported types [here](https://automatika-robotics.github.io/sugarcoat/advanced/types.html)
+    :type msg_type: Union[type[supported_types.SupportedType], str]
+    :param qos_profile: QoS profile for the topic
+    :type qos_profile: QoSConfig
+
+    Example usage:
+    ```python
+    position = Topic(name="odom", msg_type="Odometry")
+    map_meta_data = Topic(name="map_meta_data", msg_type="MapMetaData")
+    ```
+    """
+
+    pass
 
 
 @define(kw_only=True)
@@ -256,8 +352,8 @@ def _get_topic(topic: Union[Topic, Dict]) -> Topic:
 
 
 def _get_np_coordinates(
-    pre_defined: List[Union[List, tuple[np.ndarray, str]]],
-) -> List[Union[List, tuple[np.ndarray, str]]]:
+    pre_defined: List[Union[List, Tuple[np.ndarray, str]]],
+) -> List[Union[List, Tuple[np.ndarray, str]]]:
     pre_defined_list = []
     for item in pre_defined:
         pre_defined_list.append((np.array(item[0]), item[1]))
@@ -288,7 +384,7 @@ class MapLayer(BaseAttrs):
     resolution_multiple: int = field(
         default=1, validator=base_validators.in_range(min_value=0.1, max_value=10)
     )
-    pre_defined: List[Union[List, tuple[np.ndarray, str]]] = field(
+    pre_defined: List[Union[List, Tuple[np.ndarray, str]]] = field(
         default=Factory(list), converter=_get_np_coordinates
     )
 

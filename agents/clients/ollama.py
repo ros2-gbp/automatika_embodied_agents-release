@@ -1,9 +1,9 @@
-from typing import Any, Optional, Dict, Union
+from typing import Any, Optional, Dict, Union, List, Generator
 
 import httpx
 
-from ..models import LLM
-from ..utils import encode_arr_base64
+from ..models import OllamaModel
+from ..utils import encode_img_base64
 from .model_base import ModelClient
 
 __all__ = ["OllamaClient"]
@@ -14,7 +14,7 @@ class OllamaClient(ModelClient):
 
     def __init__(
         self,
-        model: Union[LLM, Dict],
+        model: Union[OllamaModel, Dict],
         host: str = "127.0.0.1",
         port: int = 11434,
         inference_timeout: int = 30,
@@ -22,8 +22,6 @@ class OllamaClient(ModelClient):
         logging_level: str = "info",
         **kwargs,
     ):
-        if isinstance(model, LLM):
-            model._set_ollama_checkpoint()
         try:
             from ollama import Client
 
@@ -32,6 +30,10 @@ class OllamaClient(ModelClient):
             raise ModuleNotFoundError(
                 "In order to use the OllamaClient, you need ollama-python package installed. You can install it with 'pip install ollama'"
             ) from e
+
+        if not isinstance(model, OllamaModel) and model["model_type"] != "OllamaModel":
+            raise TypeError("OllamaClient can only be used with an OllamaModel")
+
         super().__init__(
             model=model,
             host=host,
@@ -50,7 +52,17 @@ class OllamaClient(ModelClient):
         try:
             httpx.get(f"http://{self.host}:{self.port}").raise_for_status()
         except Exception as e:
-            self.logger.error(str(e))
+            self.logger.error(
+                f"""Failed to connect to Ollama server at {self.host}:{self.port} {e}
+
+                Make sure an Ollama is running on the given url by executing the following command:
+
+                `export OLLAMA_HOST={self.host}:{self.port}  # if not using default`
+                `ollama serve`
+
+                To install ollama, follow instructions on https://ollama.com/download
+                """
+            )
             raise
 
     def _initialize(self) -> None:
@@ -66,42 +78,40 @@ class OllamaClient(ModelClient):
                 raise Exception(
                     f"Could not pull model {self.model_init_params['checkpoint']}"
                 )
-            if sys_prompt := self.model_init_params.get("system_prompt"):
-                # create modelfile if a system prompt is given
-                modelfile = f'''FROM {self.model_init_params["checkpoint"]}
-    SYSTEM """
-    {sys_prompt}
-    """
-    '''
-                self.client.create(
-                    self.model_init_params["checkpoint"], modelfile=modelfile
-                )
-
             # load model in memory with empty request
-            self.client.generate(
-                model=self.model_init_params["checkpoint"], keep_alive=10
-            )
-            self.logger.info(f"{self.model_name} model initialized")
+            if (
+                self.model_name == "internal_ollama_embeddings"
+            ):  # Internal embeddings model name
+                self.client.embed(
+                    model=self.model_init_params["checkpoint"], keep_alive=10
+                )
+            else:
+                self.client.generate(
+                    model=self.model_init_params["checkpoint"], keep_alive=10
+                )
         except Exception as e:
-            self.logger.error(str(e))
-            return None
-
-    def _inference(self, inference_input: Dict[str, Any]) -> Optional[Dict]:
-        """Call inference on the model using data and inference parameters from the component"""
-        if not (query := inference_input.get("query")):
-            raise TypeError(
-                "OllamaClient can only be used with LLM and MLLM components"
+            self.logger.error(
+                f"Failed to initialize model {self.model_init_params['checkpoint']} on Ollama, please ensure that the checkpoint name is correct. Received the following error: {e}"
             )
+            raise
+        self.logger.info(
+            f"{self.model_name} with {self.model_init_params['checkpoint']} model initialized"
+        )
+
+    def _inference(
+        self, inference_input: Dict[str, Any]
+    ) -> Optional[Dict[str, Union[str, Generator]]]:
+        """Call inference on the model using data and inference parameters from the component"""
         # create input
         input = {
             "model": self.model_init_params["checkpoint"],
-            "messages": query,
+            "messages": inference_input.pop("query"),
+            "stream": inference_input.pop("stream"),
         }
-        inference_input.pop("query")
 
         # make images part of the latest message in message list
         if images := inference_input.get("images"):
-            input["messages"][-1]["images"] = [encode_arr_base64(img) for img in images]
+            input["messages"][-1]["images"] = [encode_img_base64(img) for img in images]
             inference_input.pop("images")
 
         # Add tools as part of input, if available
@@ -110,10 +120,16 @@ class OllamaClient(ModelClient):
             inference_input.pop("tools")
 
         # ollama uses num_predict for max_new_tokens
-        if inference_input.get("max_new_tokens"):
-            inference_input["num_predict"] = inference_input["max_new_tokens"]
-            inference_input.pop("max_new_tokens")
-        input["options"] = inference_input
+        inference_input["num_predict"] = inference_input.pop("max_new_tokens")
+
+        # merge any options specified during OllamaModel definition
+        input["options"] = (
+            {**self.model_init_params["options"], **inference_input}
+            if self.model_init_params.get("options")
+            else inference_input
+        )
+
+        self.logger.debug(f"Sending to ollama server: {input}")
 
         # call inference method
         try:
@@ -122,27 +138,54 @@ class OllamaClient(ModelClient):
             ollama_result = self.client.chat(**input)
         except Exception as e:
             self.logger.error(str(e))
-            return None
+            return
 
-        self.logger.debug(str(ollama_result))
+        if isinstance(ollama_result, Generator):
+            input["output"] = ollama_result
+            return input
+
+        if not ollama_result.get("message"):
+            self.logger.debug(
+                f"Ollama Response does not contain any model output: {ollama_result}"
+            )
+            return
+
+        # if tool calls exist
+        if tool_calls := ollama_result["message"].get("tool_calls"):  # type: ignore
+            input["tool_calls"] = tool_calls
+
+        input["output"] = ollama_result["message"].get("content", "")
+        return input
+
+    def _embed(
+        self, input: Union[str, List[str]], truncate: bool = False
+    ) -> Optional[List[List]]:
+        # create input
+        embedding_input = {
+            "model": self.model_init_params["checkpoint"],
+            "input": input,
+            "truncate": truncate,
+        }
+
+        # call embedding method
+        try:
+            # set timeout on underlying httpx client
+            self.client._client.timeout = self.inference_timeout
+            ollama_result = self.client.embed(**embedding_input)
+        except Exception as e:
+            self.logger.error(str(e))
+            return
+
+        self.logger.debug(
+            f"Created embeddings of length: {len(ollama_result['embeddings'])}"
+        )
 
         # make result part of the input
-        if output := ollama_result["message"].get("content"):
-            input["output"] = output  # type: ignore
-            # if tool calls exist
-            if tool_calls := ollama_result["message"].get("tool_calls"):  # type: ignore
-                input["tool_calls"] = tool_calls
-            return input
-        else:
-            # if tool calls exist
-            if tool_calls := ollama_result["message"].get("tool_calls"):  # type: ignore
-                input["output"] = ""  # Add empty output for tool calls
-                input["tool_calls"] = tool_calls
-                return input
-
-            # no output or tool calls
-            self.logger.debug("Output not received")
+        if not (result := ollama_result.get("embeddings")) or not result:
+            self.logger.error("Embeddings not generated")
             return
+
+        return ollama_result["embeddings"]
 
     def _deinitialize(self):
         """Deinitialize the model on the platform"""
@@ -154,4 +197,3 @@ class OllamaClient(ModelClient):
             )
         except Exception as e:
             self.logger.error(str(e))
-            return None

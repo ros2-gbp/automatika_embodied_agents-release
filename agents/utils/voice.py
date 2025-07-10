@@ -1,14 +1,44 @@
-from typing import Optional
+from typing import Optional, List
+from typing import Callable
+import logging
+
 import numpy as np
 from .utils import VADStatus, WakeWordStatus
-from typing import Callable
 
 try:
     import onnxruntime as ort
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError(
-        "VAD in SpeechToText components requires onnxruntime to be installed. Please install them with `pip install onnxruntime`"
+        """enable_vad and enable_wakeword in SpeechToText component requires onnxruntime to be installed. Please install them with `pip install onnxruntime` or `pip install onnxruntime-gpu` for cpu or gpu based deployment.
+
+        For Jetson devices you can download the pre-built ONNX runtime wheels corresponding to your Jetpack version at https://elinux.org/Jetson_Zoo#ONNX_Runtime"""
     ) from e
+
+
+def _get_onnx_providers(device: str, model: str) -> List[str]:
+    """Check for available providers"""
+    available = ort.get_available_providers()
+    logger = logging.getLogger(model)
+
+    if device == "cuda":
+        if "CUDAExecutionProvider" not in available:
+            logger.warning(
+                f"CUDA is not available for {model}. Ensure the correct CUDA/cuDNN versions are installed and install ONNX Runtime with `pip install onnxruntime-gpu`. Switching to CPU runtime."
+            )
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    if device == "tensorrt":
+        if "TensorrtExecutionProvider" not in available:
+            logger.warning(
+                f"Tensorrt is not available for {model}. Ensure the correct CUDA/cuDNN versions are installed and install ONNX Runtime with TensorRT support. Switching to CPU runtime."
+            )
+        return [
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+
+    return ["CPUExecutionProvider"]
 
 
 class VADIterator:
@@ -47,12 +77,9 @@ class VADIterator:
         sessionOptions.inter_op_num_threads = ncpu
         sessionOptions.intra_op_num_threads = ncpu
 
+        providers = _get_onnx_providers(device, "VAD")
         self.model = ort.InferenceSession(
-            model_path,
-            sess_options=sessionOptions,
-            providers=["CUDAExecutionProvider"]
-            if device == "gpu"
-            else ["CPUExecutionProvider"],
+            model_path, sess_options=sessionOptions, providers=providers
         )
 
         # State variable required by vad model
@@ -131,13 +158,10 @@ class AudioFeatures:
         sessionOptions.inter_op_num_threads = ncpu
         sessionOptions.intra_op_num_threads = ncpu
 
+        providers = _get_onnx_providers(device, "WakeWord")
         # Initialize melspectrogram model
         self.melspec_model = ort.InferenceSession(
-            melspectogram_model_path,
-            sess_options=sessionOptions,
-            providers=["CUDAExecutionProvider"]
-            if device == "gpu"
-            else ["CPUExecutionProvider"],
+            melspectogram_model_path, sess_options=sessionOptions, providers=providers
         )
 
         self.melspec_model_predict = lambda x: self.melspec_model.run(
@@ -146,11 +170,7 @@ class AudioFeatures:
 
         # Initialize audio embedding model
         self.embedding_model = ort.InferenceSession(
-            embedding_model_path,
-            sess_options=sessionOptions,
-            providers=["CUDAExecutionProvider"]
-            if device == "gpu"
-            else ["CPUExecutionProvider"],
+            embedding_model_path, sess_options=sessionOptions, providers=providers
         )
 
         self.embedding_model_predict = lambda x: self.embedding_model.run(
@@ -224,7 +244,8 @@ class WakeWord:
     """
     A wakeword model classification class that uses pre-trained wakeword models adapted for models presented in [openWakeWord project](https://github.com/dscripka/openWakeWord/).
     This class consumed audio embeddings and gives out the probability of detecting a wakeword.
-    Simple models like 2 layer RNNs work fairly well as wakeword classification models. Pre-trained models from openWakeWord are available [here](https://github.com/dscripka/openWakeWord/tree/main?tab=readme-ov-file#pre-trained-models). To train a custom model, follow this simple [tutorial](https://github.com/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb) provided by openWakeWord. Please check [licensing information](https://github.com/dscripka/openWakeWord/tree/main?tab=readme-ov-file#license) for pre-trained models, before utilizing them.
+    Simple models like 2 layer RNNs work fairly well as wakeword classification models. Pre-trained models from openWakeWord are available [here](https://github.com/dscripka/openWakeWord/tree/main?tab=readme-ov-file#pre-trained-models).
+    To train a custom model, follow this simple [tutorial](https://github.com/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb) provided by openWakeWord. Please check [licensing information](https://github.com/dscripka/openWakeWord/tree/main?tab=readme-ov-file#license) for pre-trained models, before utilizing them.
     """
 
     def __init__(
@@ -238,12 +259,10 @@ class WakeWord:
         sessionOptions.inter_op_num_threads = ncpu
         sessionOptions.intra_op_num_threads = ncpu
 
+        providers = _get_onnx_providers(device, "WakeWord")
+        # Create inference session
         self.model = ort.InferenceSession(
-            model_path,
-            sess_options=sessionOptions,
-            providers=["CUDAExecutionProvider"]
-            if device == "gpu"
-            else ["CPUExecutionProvider"],
+            model_path, sess_options=sessionOptions, providers=providers
         )
         self.model_input = self.model.get_inputs()[0].shape[1]
         self.model_output = self.model.get_outputs()[0].shape[1]
@@ -269,3 +288,77 @@ class WakeWord:
                 return WakeWordStatus.END
             else:
                 return WakeWordStatus.ONGOING
+
+
+class HypothesisBuffer:
+    """A simplified Hypothesis buffer for collection output from a streaming speech to text model based on [whisper_stream](https://github.com/ufal/whisper_streaming). Implements LocalAgreement-n policy as used in CUNI-KIT at IWSLT 2022 etc. before.
+        @inproceedings{machacek-etal-2023-turning,
+        title = "Turning Whisper into Real-Time Transcription System",
+        author = "Mach{\'a}{\v{c}}ek, Dominik  and
+          Dabre, Raj  and
+          Bojar, Ond{\v{r}}ej",
+        editor = "Saha, Sriparna  and
+          Sujaini, Herry",
+        booktitle = "Proceedings of the 13th International Joint Conference on Natural Language Processing and the 3rd Conference of the Asia-Pacific Chapter of the Association for Computational Linguistics: System Demonstrations",
+        month = nov,
+        year = "2023",
+        address = "Bali, Indonesia",
+        publisher = "Association for Computational Linguistics",
+        url = "https://aclanthology.org/2023.ijcnlp-demo.3",
+        pages = "17--24",
+    }
+    """
+
+    def __init__(self):
+        self.commited_in_buffer = []
+        self.buffer = []
+        self.new = []
+        self.last_commited_time = 0
+
+    def reset(self):
+        self.commited_in_buffer = []
+        self.buffer = []
+        self.new = []
+        self.last_commited_time = 0
+
+    def insert(self, new):
+        # Add new words
+        self.new = [(a, b, t) for a, b, t in new if a > self.last_commited_time - 0.1]
+
+        # Remove up to 5 duplicates if they exist in previously commited
+        if self.new and self.commited_in_buffer:
+            cn = len(self.commited_in_buffer)
+            nn = len(self.new)
+            for i in range(1, min(min(cn, nn), 5) + 1):
+                c = " ".join(
+                    [self.commited_in_buffer[-j][2] for j in range(1, i + 1)][::-1]
+                )
+                tail = " ".join(self.new[j - 1][2] for j in range(1, i + 1))
+                if c == tail:
+                    [repr(self.new.pop(0)) for _ in range(i)]
+                    break
+
+    def flush(self):
+        commit = []
+        # loop to confirm words in transcript received in previous step
+        while self.new:
+            if not self.buffer:
+                break
+            na, nb, nt = self.new[0]
+            if nt == self.buffer[0][2] and abs(na - self.buffer[0][0]) < 0.2:
+                commit.append((na, nb, nt))
+                self.last_commited_time = nb
+                self.buffer.pop(0)
+                self.new.pop(0)
+            else:
+                break
+
+        self.buffer = self.new
+        self.new = []
+        # commit confirmed words
+        self.commited_in_buffer.extend(commit)
+        return commit
+
+    def complete(self):
+        # send any remaining words in buffer
+        return self.buffer

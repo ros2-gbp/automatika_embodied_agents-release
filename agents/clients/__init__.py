@@ -1,5 +1,5 @@
 """
-Clients are standard interfaces for components to interact with ML models or vector DBs served by various platforms. Currently ROS Agents provides the following clients, which cover the most popular open source model deployment platforms. Simple clients can be easily implemented for other platforms and the use of heavy duct-tape "AI" frameworks on the robot is discouraged 😅.
+Clients are standard interfaces for components to interact with ML models or vector DBs served by various platforms. Currently _EmbodiedAgents_ provides the following clients, which cover the most popular open source model deployment platforms. Simple clients can be easily implemented for other platforms and the use of unnecessarily heavy duct-tape "AI" frameworks on the robot is discouraged 😅.
 
 ```{note}
 Some clients might need additional dependacies, which are provided in the following table. If missing the user will also be prompted for them at runtime.
@@ -12,36 +12,51 @@ Some clients might need additional dependacies, which are provided in the follow
   - Client
   - Description
 
-* - **RoboML**
-  - [HTTPModelClient](agents.clients.roboml.HTTPModelClient)
-  - An HTTP client for interaction with ML models served on RoboML.
+* - **Generic**
+  - [GenericHTTPClient](agents.clients.generic.GenericHTTPClient)
+  - A generic client for interacting with OpenAI-compatible APIs, including vLLM, ms-swift, lmdeploy, Google Gemini, etc. Supports both standard and streaming responses, and works with LLMS and multimodal LLMs. Designed to be compatible with any API following the OpenAI standard.
 
 * - **RoboML**
-  - [HTTPDBClient](agents.clients.roboml.HTTPDBClient)
-  - An HTTP client for interaction with vector DBs served on RoboML.
+  - [RoboMLHTTPClient](agents.clients.roboml.RoboMLHTTPClient)
+  - An HTTP client for interacting with ML models served on [RoboML](https://github.com/automatika-robotics/roboml). Supports streaming outputs.
 
 * - **RoboML**
-  - [RESPModelClient](agents.clients.roboml.RESPModelClient)
-  - A Redis Serialization Protocol (RESP) based client for interaction with ML models served on RoboML. **Note:** In order to use this client, please install dependancies with `pip install redis[hiredis] msgpack msgpack-numpy`
+  - [RoboMLWSClient](agents.clients.roboml.RoboMLWSClient)
+  - A WebSocket-based client for persistent interaction with [RoboML](https://github.com/automatika-robotics/roboml)-hosted ML models. Particularly useful for low-latency streaming of audio or text data.
 
 * - **RoboML**
-  - [RESPDBClient](agents.clients.roboml.RESPDBClient)
-  - A Redis Serialization Protocol (RESP) based client for interaction with vector DBs served on RoboML. **Note:** In order to use this client, please install dependancies with `pip install redis[hiredis] msgpack msgpack-numpy`
+  - [RoboMLRESPClient](agents.clients.roboml.RoboMLRESPClient)
+  - A Redis Serialization Protocol (RESP) based client for ML models served via [RoboML](https://github.com/automatika-robotics/roboml).
+    Requires `pip install redis[hiredis]`.
 
 * - **Ollama**
   - [OllamaClient](agents.clients.ollama.OllamaClient)
-  - An HTTP client for interaction with ML models served on Ollama. **Note:** In order to use this client, please install dependancies with `pip install ollama`
+  - An HTTP client for interacting with ML models served on [Ollama](https://ollama.com). Supports LLMs/MLLMs and embedding models. It can be invoked with the generic [OllamaModel](agents.models.md#classes).
+    Requires `pip install ollama`.
 
+* - **ChromaDB**
+  - [ChromaClient](agents.clients.chroma.ChromaClient)
+  - An HTTP client for interacting with a ChromaDB instance running as a server.
+    Ensure that a ChromaDB server is active using:<br/>
+    `pip install chromadb`<br/>
+    `chroma run --path /db_path`
 """
 
+from .generic import GenericHTTPClient
 from .ollama import OllamaClient
-from .roboml import HTTPDBClient, HTTPModelClient, RESPDBClient, RESPModelClient
+from .roboml import (
+    RoboMLHTTPClient,
+    RoboMLRESPClient,
+    RoboMLWSClient,
+)
+from .chroma import ChromaClient
 
 
 __all__ = [
+    "GenericHTTPClient",
     "OllamaClient",
-    "HTTPDBClient",
-    "HTTPModelClient",
-    "RESPDBClient",
-    "RESPModelClient",
+    "ChromaClient",
+    "RoboMLHTTPClient",
+    "RoboMLRESPClient",
+    "RoboMLWSClient",
 ]
