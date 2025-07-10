@@ -7,7 +7,7 @@ import msgpack_numpy as m_pack
 from ..callbacks import TextCallback
 from ..clients.db_base import DBClient
 from ..clients.model_base import ModelClient
-from ..clients import OllamaClient
+from ..clients import OllamaClient, GenericHTTPClient
 from ..config import LLMConfig
 from ..ros import FixedInput, String, Topic, Detections
 from ..utils import get_prompt_template, validate_func_args
@@ -40,11 +40,7 @@ class LLM(ModelComponent):
     :param trigger: The trigger value or topic for the LLM component.
         This can be a single Topic object, a list of Topic objects, or a float value for a timed component. Defaults to 1.
     :type trigger: Union[Topic, list[Topic], float]
-    :param callback_group: An optional callback group for the LLM component.
-        If provided, this should be a string. Otherwise, it defaults to None.
-    :type callback_group: str
-    :param component_name: The name of the LLM component.
-        This should be a string and defaults to "llm_component".
+    :param component_name: The name of the LLM component. This should be a string.
     :type component_name: str
     :param kwargs: Additional keyword arguments for the LLM.
 
@@ -74,7 +70,6 @@ class LLM(ModelComponent):
         db_client: Optional[DBClient] = None,
         trigger: Union[Topic, List[Topic], float] = 1.0,
         component_name: str,
-        callback_group=None,
         **kwargs,
     ):
         self.config: LLMConfig = config or LLMConfig()
@@ -95,7 +90,13 @@ class LLM(ModelComponent):
             if self.config._component_prompt
             else None
         )
-        self.messages: List[Dict] = []
+
+        # Initialize a messages buffer
+        self.messages: List[Dict] = (
+            [{"role": "system", "content": self.config._system_prompt}]
+            if self.config._system_prompt
+            else []
+        )
 
         super().__init__(
             inputs,
@@ -103,7 +104,6 @@ class LLM(ModelComponent):
             model_client,
             self.config,
             trigger,
-            callback_group,
             component_name,
             **kwargs,
         )
@@ -112,6 +112,12 @@ class LLM(ModelComponent):
         # configure the rest
         super().custom_on_configure()
 
+        # add system prompt if set after init
+        self.messages: List[Dict] = (
+            [{"role": "system", "content": self.config._system_prompt}]
+            if self.config._system_prompt
+            else []
+        )
         # add component prompt if set after init
         self.component_prompt = (
             get_prompt_template(self.config._component_prompt)
@@ -129,6 +135,11 @@ class LLM(ModelComponent):
         if self.db_client:
             self.db_client.check_connection()
             self.db_client.initialize()
+
+        # initialize response buffers used for streaming
+        if self.config.stream:
+            self.result_partial: List = []
+            self.result_complete: List = []
 
     def custom_on_deactivate(self):
         # deactivate db client
@@ -206,14 +217,24 @@ class LLM(ModelComponent):
     def _handle_chat_history(self, message: Dict) -> None:
         """Internal handler for chat history"""
         if not self.config.chat_history:
-            self.messages = [message]
+            # keep system prompt if set else empty the list
+            self.messages = self.messages[:1] if self.config._system_prompt else []
         else:
-            self.messages.append(message)
-
             # if the size of history exceeds specified size than take out first
-            # two messages
-            if len(self.messages) / 2 > self.config.history_size:
-                self.messages = self.messages[2:]
+            # two messages (keeping system prompt if it exists)
+            messages_length = (
+                len(self.messages)
+                if not self.config._system_prompt
+                else len(self.messages) - 1
+            )
+            if messages_length / 2 > self.config.history_size + 1:
+                self.messages = (
+                    self.messages[2:]
+                    if not self.config._system_prompt
+                    else self.messages[:1] + self.messages[3:]
+                )
+
+        self.messages.append(message)
 
     def _handle_tool_calls(self, result: Dict) -> Optional[Dict]:
         """Internal handler for tool calling"""
@@ -278,6 +299,22 @@ class LLM(ModelComponent):
             # return result with its output set to last function response
             return result
 
+    def _extract_query_and_context(self, kwargs, context: dict) -> Optional[str]:
+        """Extract the query from the trigger topic and initialize context."""
+        if trigger := kwargs.get("topic"):
+            query = self.trig_callbacks[trigger.name].get_output()
+            context[trigger.name] = query
+            return query
+        return None
+
+    def _should_reset_chat(self, query: Optional[str]) -> bool:
+        """Check if the chat should be reset based on the query."""
+        return bool(
+            self.config.chat_history
+            and query
+            and query.strip().lower() == self.config.history_reset_phrase
+        )
+
     def _create_input(self, *_, **kwargs) -> Optional[Dict[str, Any]]:
         """Create inference input for LLM models
         :param args:
@@ -286,32 +323,25 @@ class LLM(ModelComponent):
         """
         # context dict to gather all String inputs for use in system prompt
         context = {}
+
         # set llm query as trigger
-        if trigger := kwargs.get("topic"):
-            query = self.trig_callbacks[trigger.name].get_output()
-            context[trigger.name] = query
-
-            # handle chat reset
-            if (
-                self.config.chat_history
-                and query.strip().lower() == self.config.history_reset_phrase
-            ):
-                self.messages = []
-                return None
-
-        else:
-            query = None
+        query = self._extract_query_and_context(kwargs, context)
+        if self._should_reset_chat(query):
+            self.messages = []
+            return None
 
         # aggregate all inputs that are available
         for i in self.callbacks.values():
-            if (item := i.get_output()) is not None:
-                # set trigger equal to a topic with type String if trigger not found
-                if i.input_topic.msg_type is String:
-                    if not query:
-                        query = item
-                    context[i.input_topic.name] = item
-                elif i.input_topic.msg_type is Detections:
-                    context[i.input_topic.name] = item
+            if (item := i.get_output()) is None:
+                continue
+            msg_type = i.input_topic.msg_type
+            # set trigger equal to a topic with type String if trigger not found
+            if msg_type is String:
+                if not query:
+                    query = item
+                context[i.input_topic.name] = item
+            elif msg_type is Detections:
+                context[i.input_topic.name] = item
 
         if query is None:
             return None
@@ -334,7 +364,7 @@ class LLM(ModelComponent):
 
         input = {
             "query": self.messages,
-            **self.config._get_inference_params(),
+            **self.inference_params,
         }
 
         # Add any tools, if registered
@@ -343,6 +373,68 @@ class LLM(ModelComponent):
 
         return input
 
+    def __process_stream_token(self, token: str):
+        """
+        Processes a single token from a stream based on the break_character config.
+        """
+        if self.config.break_character:
+            self.result_partial.append(token)
+            if self.config.break_character in token:
+                self.result_complete += self.result_partial
+                self._publish({"output": "".join(self.result_partial)})
+                self.result_partial = []
+        else:
+            self.result_complete.append(token)
+            self._publish({"output": token})
+            self.result_partial = []
+
+    def __finalize_stream(self):
+        """
+        Finalizes the stream by publishing any remaining partial results and
+        appending the complete message to the message history.
+        """
+        # Send remaining result after break character or termination if any
+        if self.result_partial:
+            self.result_complete += self.result_partial
+            self._publish({"output": "".join(self.result_partial)})
+            self.result_partial = []
+
+        self.messages.append({
+            "role": "assistant",
+            "content": "".join(self.result_complete),
+        })
+
+    def _handle_websocket_streaming(self) -> Optional[List]:
+        """Handle streaming output from a websocket client"""
+        try:
+            token = self.resp_queue.get(block=True)
+            if token and token != self.config.response_terminator:
+                self.__process_stream_token(token)
+            elif token:  # Token is the response_terminator, finalize stream
+                self.__finalize_stream()
+        except Exception as e:
+            self.get_logger().error(str(e))
+            # raise a fallback trigger via health status
+            self.health_status.set_failure()
+
+    def __handle_streaming_generator(self, result: Dict) -> Optional[List]:
+        """Handle streaming output"""
+        try:
+            for token in result["output"]:
+                # Handle ollama client streaming format
+                if isinstance(self.model_client, OllamaClient):
+                    token = token["message"]["content"]
+                elif isinstance(self.model_client, GenericHTTPClient):
+                    token = token["choices"][0]["delta"]["content"]
+                self.__process_stream_token(token)
+
+            # finalize stream after the generator is exhausted
+            self.__finalize_stream()
+        except Exception as e:
+            self.get_logger().error(str(e))
+            # raise a fallback trigger via health status
+            self.health_status.set_failure()
+
     def _execution_step(self, *args, **kwargs):
         """_execution_step.
 
@@ -350,8 +442,7 @@ class LLM(ModelComponent):
         :param kwargs:
         """
 
-        if self.run_type is ComponentRunType.EVENT:
-            trigger = kwargs.get("topic")
+        if self.run_type is ComponentRunType.EVENT and (trigger := kwargs.get("topic")):
             if not trigger:
                 return
             self.get_logger().debug(f"Received trigger on topic {trigger.name}")
@@ -367,11 +458,14 @@ class LLM(ModelComponent):
             return
 
         # conduct inference
-        result = self.model_client.inference(inference_input)
+        result = self._call_inference(inference_input)
 
         if result:
-            result_message = {"role": "assistant", "content": result["output"]}
-            self.messages.append(result_message)
+            if self.config.stream:
+                self.__handle_streaming_generator(result)
+                return
+
+            self.messages.append({"role": "assistant", "content": result["output"]})
 
             # handle tool calls
             if self.config._tool_descriptions:
@@ -383,14 +477,13 @@ class LLM(ModelComponent):
                 return
 
             # publish inference result
-            if hasattr(self, "publishers_dict"):
-                for publisher in self.publishers_dict.values():
-                    publisher.publish(**result)
+            self._publish(result)
 
         else:
             # raise a fallback trigger via health status
             self.health_status.set_failure()
 
+    @validate_func_args
     def set_topic_prompt(self, input_topic: Topic, template: Union[str, Path]) -> None:
         """Set prompt template on any input topic of type string.
 
@@ -407,7 +500,7 @@ class LLM(ModelComponent):
                             model_client=model_client,
                             config=config,
                             component_name='llama_component')
-        llm_component.set_topic_prompt(text0, template="You are an amazing and funny robot. You answer all questions with short and concise answers. Please answer the following: {{ text0 }}")
+        llm_component.set_topic_prompt(text0, template="Please answer the following: {{ text0 }}")
         ```
         """
         if callback := self.callbacks.get(input_topic.name):
@@ -419,6 +512,7 @@ class LLM(ModelComponent):
                 )
             self.config._topic_prompts[input_topic.name] = template
 
+    @validate_func_args
     def set_component_prompt(self, template: Union[str, Path]) -> None:
         """Set component level prompt template which can use multiple input topics.
 
@@ -433,11 +527,32 @@ class LLM(ModelComponent):
                             model_client=model_client,
                             config=config,
                             component_name='llama_component')
-        llm_component.set_component_prompt(template="You are an amazing and funny robot. You answer all questions with short and concise answers. You can see the following items: {{ detections }}. Please answer the following: {{ text0 }}")
+        llm_component.set_component_prompt(template="You can see the following items: {{ detections }}. Please answer the following: {{ text0 }}")
         ```
         """
         self.config._component_prompt = template
 
+    @validate_func_args
+    def set_system_prompt(self, prompt: str) -> None:
+        """Set system prompt for the model, which defines the models 'personality'.
+
+        :param prompt: string or a path to a file containing the string.
+        :type template: Union[str, Path]
+        :rtype: None
+
+        Example usage:
+        ```python
+        llm_component = LLM(inputs=[text0],
+                            outputs=[text1],
+                            model_client=model_client,
+                            config=config,
+                            component_name='llama_component')
+        llm_component.set_system_prompt(prompt="You are an amazing and funny robot. You answer all questions with short and concise answers.")
+        ```
+        """
+        self.config._system_prompt = prompt
+
+    @validate_func_args
     def register_tool(
         self,
         tool: Callable,
@@ -488,6 +603,10 @@ class LLM(ModelComponent):
             raise TypeError(
                 "Currently registering tools is only supported when using an Ollama client with the component."
             )
+        if self.config.stream:
+            raise TypeError(
+                "Tools cannot be registered for a component with streaming output. Please set stream option to False."
+            )
         self._external_processors[tool_description["function"]["name"]] = (
             [tool],
             "tool",
@@ -524,7 +643,7 @@ class LLM(ModelComponent):
         import time
 
         message = {"role": "user", "content": "Hello robot."}
-        inference_input = {"query": [message], **self.config._get_inference_params()}
+        inference_input = {"query": [message], **self.inference_params}
 
         # Run inference once to warm up and once to measure time
         self.model_client.inference(inference_input)
@@ -534,5 +653,10 @@ class LLM(ModelComponent):
         result = self.model_client.inference(inference_input)
         elapsed_time = time.time() - start_time
 
-        self.get_logger().warning(f"Model Output: {result['output']}")
-        self.get_logger().warning(f"Approximate Inference time: {elapsed_time} seconds")
+        if result:
+            self.get_logger().warning(f"Model Output: {result['output']}")
+            self.get_logger().warning(
+                f"Approximate Inference time: {elapsed_time} seconds"
+            )
+        else:
+            self.get_logger().error("Model inference failed during warmup.")
