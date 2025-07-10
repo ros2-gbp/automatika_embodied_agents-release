@@ -1,11 +1,16 @@
 from abc import abstractmethod
 import inspect
 import json
-from typing import Any, Optional, Sequence, Union, List, Dict
+import queue
+import threading
+from typing import Any, Optional, Sequence, Union, List, Dict, Type
+import msgpack
+
 
 from ..clients.model_base import ModelClient
+from ..clients.roboml import RoboMLWSClient
 from ..config import ModelComponentConfig
-from ..ros import FixedInput, Topic, SupportedType
+from ..ros import FixedInput, Topic, SupportedType, MutuallyExclusiveCallbackGroup
 from .component_base import Component
 
 
@@ -19,14 +24,13 @@ class ModelComponent(Component):
         model_client: Optional[ModelClient] = None,
         config: Optional[ModelComponentConfig] = None,
         trigger: Union[Topic, List[Topic], float] = 1.0,
-        callback_group=None,
         component_name: str = "model_component",
         **kwargs,
     ):
         # setup model client
         self.model_client = model_client if model_client else None
 
-        self.handled_outputs: List[type[SupportedType]]
+        self.handled_outputs: List[Type[SupportedType]]
 
         if not config:
             self.config = ModelComponentConfig()
@@ -37,7 +41,6 @@ class ModelComponent(Component):
             outputs,
             config,
             trigger,
-            callback_group,
             component_name,
             **kwargs,
         )
@@ -56,11 +59,47 @@ class ModelComponent(Component):
         if self.model_client:
             self.model_client.check_connection()
             self.model_client.initialize()
-            if self.config.warmup:
-                try:
-                    self._warmup()
-                except Exception as e:
-                    self.get_logger().error(f"Error encountered in warmup: {e}")
+            if isinstance(self.model_client, RoboMLWSClient):
+                # create queues and threads for the websocket client
+                self.req_queue = queue.Queue()
+                self.resp_queue = queue.Queue()
+                self.client_stop_event = threading.Event()
+                self.model_client.request_queue = self.req_queue
+                self.model_client.response_queue = self.resp_queue
+                self.model_client.stop_event = self.client_stop_event
+                self.client_thread = threading.Thread(
+                    target=self.model_client._inference,
+                    name="WebSocketClientThread",
+                    daemon=True,
+                )
+                self.client_thread.start()
+
+                # Create a fast timer for publishing websocket client outputs
+                # asynchronously in case of streaming. The callback is implemented
+                # in child components and gets executed in a blocking manner
+                if getattr(self.config, "stream", None):
+                    self.create_timer(
+                        timer_period_sec=0.001,
+                        callback=self._handle_websocket_streaming,
+                        callback_group=MutuallyExclusiveCallbackGroup(),
+                    )
+                    self.get_logger().debug(
+                        "Started timer for handling websocket streaming"
+                    )
+                if self.config.warmup:
+                    # TODO: warmup with websockets
+                    self.get_logger().warning(
+                        "Warmup cannot not be called with websocket client."
+                    )
+            else:
+                if self.config.warmup:
+                    try:
+                        self._warmup()
+                    except Exception as e:
+                        self.get_logger().error(f"Error encountered in warmup: {e}")
+
+        # get inference params
+        self.inference_params = self.config.get_inference_params()
 
     def custom_on_deactivate(self):
         """
@@ -70,6 +109,23 @@ class ModelComponent(Component):
         if self.model_client:
             self.model_client.check_connection()
             self.model_client.deinitialize()
+            if isinstance(self.model_client, RoboMLWSClient):
+                # stop running thread
+                self.client_stop_event.set()
+                self.client_thread.join(timeout=10)
+                # mark any pendings tasks as finished
+                while not self.resp_queue.empty():
+                    try:
+                        self.resp_queue.get_nowait()
+                        self.resp_queue.task_done()
+                    except queue.Empty:
+                        break
+                while not self.req_queue.empty():
+                    try:
+                        self.req_queue.get_nowait()
+                        self.req_queue.task_done()
+                    except queue.Empty:
+                        break
 
     def _validate_output_topics(self) -> None:
         """
@@ -128,6 +184,58 @@ class ModelComponent(Component):
         raise NotImplementedError(
             "_warmup method needs to be implemented by child components."
         )
+
+    @abstractmethod
+    def _handle_websocket_streaming(self) -> Optional[Any]:
+        """__handle_websocket_streaming.
+
+        :param args:
+        :param kwargs:
+        """
+        raise NotImplementedError(
+            "__handle_websocket_streaming method needs to be implemented by child components."
+        )
+
+    def _call_inference(
+        self, inference_input: Dict, unpack: bool = False
+    ) -> Optional[Dict]:
+        """Call model inference"""
+        if isinstance(self.model_client, RoboMLWSClient):
+            self.req_queue.put_nowait(inference_input)
+            if getattr(self.config, "stream", None):
+                return
+            else:
+                result = {}
+                try:
+                    if not unpack:
+                        result["output"] = self.resp_queue.get(
+                            block=True, timeout=self.model_client.inference_timeout
+                        )
+                    else:
+                        result["output"] = msgpack.unpackb(
+                            self.resp_queue.get(
+                                block=True, timeout=self.model_client.inference_timeout
+                            )
+                        )
+                    return result
+                except queue.Empty:
+                    self.get_logger().error(
+                        "Did not recieve result in websocket response queue"
+                    )
+                    return None
+        else:
+            if self.model_client:
+                return self.model_client.inference(inference_input)
+
+    def _publish(self, result: Dict, **kwargs) -> None:
+        """
+        Publishes the given result to all registered publishers.
+
+        :param result: A dictionary containing the data to be published.
+        :type result: dict
+        """
+        for publisher in self.publishers_dict.values():
+            publisher.publish(**result, **kwargs)
 
     def _update_cmd_args_list(self):
         """

@@ -27,8 +27,6 @@ class SemanticRouter(Component):
     :param db_client:
         A database client that is used to store and retrieve routing information.
     :type db_client: DBClient
-    :param callback_group:
-        An optional callback group for this component.
     :param component_name:
         The name of this Semantic Router component (default: "router_component").
     :type component_name: str
@@ -62,7 +60,7 @@ class SemanticRouter(Component):
         ],
     )
     config = SemanticRouterConfig(router_name="my_router")
-    db_client = DBClient(db=ChromaDB("database_name"))
+    db_client = HTTPDBClient(db=ChromaDB(host='localhost', port=8080))
     semantic_router = SemanticRouter(
         inputs=[input_text],
         routes=[route1, route2],
@@ -84,7 +82,6 @@ class SemanticRouter(Component):
         db_client: DBClient,
         default_route: Optional[Route] = None,
         component_name: str,
-        callback_group=None,
         **kwargs,
     ):
         self.config: SemanticRouterConfig = config
@@ -97,7 +94,6 @@ class SemanticRouter(Component):
             None,
             self.config,
             inputs,
-            callback_group,
             component_name,
             **kwargs,
         )
