@@ -1,10 +1,12 @@
-from typing import Any, Union, Optional, List, Dict
+from typing import Any, Union, Optional, List, Dict, Tuple
 import queue
 import threading
 import numpy as np
 from collections import deque
 
+import msgpack
 from ..clients.model_base import ModelClient
+from agents.clients import RoboMLWSClient
 from ..config import SpeechToTextConfig
 from ..ros import Audio, String, Topic
 from ..utils import validate_func_args, VADStatus, WakeWordStatus, load_model
@@ -31,11 +33,7 @@ class SpeechToText(ModelComponent):
     :param trigger: The trigger value or topic for the STT.
         This can be a single Topic object, a list of Topic objects.
     :type trigger: Union[Topic, list[Topic], float]
-    :param callback_group: An optional callback group for the STT.
-        If provided, this should be a string. Otherwise, it defaults to None.
-    :type callback_group: str
-    :param component_name: The name of the STT component.
-        This should be a string and defaults to "speechtotext_component".
+    :param component_name: The name of the STT component. This should be a string.
     :type component_name: str
 
     Example usage:
@@ -65,7 +63,6 @@ class SpeechToText(ModelComponent):
         config: Optional[SpeechToTextConfig] = None,
         trigger: Union[Topic, List[Topic]],
         component_name: str,
-        callback_group=None,
         **kwargs,
     ):
         self.config: SpeechToTextConfig = config or SpeechToTextConfig()
@@ -77,13 +74,19 @@ class SpeechToText(ModelComponent):
                 "SpeechToText component cannot be started as a timed component"
             )
 
+        if self.config.stream and not isinstance(model_client, RoboMLWSClient):
+            raise TypeError(
+                "SpeechToText component can only stream audio to the server when using RoboMLWebSocketClient. Please set stream to False in config or use a different client."
+            )
+
+        self.model_client = model_client
+
         super().__init__(
             inputs,
             outputs,
             model_client,
             self.config,
             trigger,
-            callback_group,
             component_name,
             **kwargs,
         )
@@ -141,7 +144,24 @@ class SpeechToText(ModelComponent):
                     device=self.config.device_wakeword,
                 )
                 self.wake_word_triggered = False
-            self.listening_thread = threading.Thread(target=self._process_audio).start()
+
+            # initialize response buffer used for output when streaming input
+            if self.config.stream:
+                from ..utils.voice import HypothesisBuffer
+
+                self.transcript_buffer: HypothesisBuffer = HypothesisBuffer()
+                self.result_partial: List = []
+                self.min_chunk_size = int(
+                    self.config._sample_rate
+                    * self.config.min_chunk_size
+                    / (1000 * self.config._block_size)
+                )
+
+            # start listening thread
+            self.listening_thread = threading.Thread(
+                target=self._process_audio, daemon=True
+            )
+            self.listening_thread.start()
 
     def custom_on_deactivate(self):
         # If VAD is enabled, stop the listening stream thread
@@ -153,29 +173,9 @@ class SpeechToText(ModelComponent):
         # Deactivate component
         super().custom_on_deactivate()
 
-    def _create_input(self, *_, **kwargs) -> Optional[Dict[str, Any]]:
-        """Create inference input for SpeechToText models
-        :param args:
-        :param kwargs:
-        :rtype: dict[str, Any]
-        """
-
-        if self.config.enable_vad and kwargs.get("speech") is not None:
-            query = kwargs["speech"]
-        else:
-            # set query as trigger
-            trigger = kwargs.get("topic")
-            if not trigger:
-                return None
-            query = self.trig_callbacks[trigger.name].get_output()
-            if query is None or len(query) == 0:
-                return None
-
-        return {"query": query, **self.config._get_inference_params()}
-
-    def _stream_callback(
+    def __stream_callback(
         self, indata: bytes, frames: int, _, status
-    ) -> tuple[bytes, int]:
+    ) -> Tuple[bytes, int]:
         """Stream callback function for processing audio
 
         :param indata:
@@ -205,9 +205,21 @@ class SpeechToText(ModelComponent):
             self.audio_features(np_frames)
             if self.wake_word_triggered:
                 self.speech_buffer.append(indata)
+
+                # Send input if streaming enabled
+                if (
+                    self.config.stream
+                    and len(self.speech_buffer) >= self.min_chunk_size
+                ):
+                    self._execution_step(speech=self.speech_buffer)
+
         # otherwise store speech when vad is triggered
         elif self.vad_iterator.triggered:
             self.speech_buffer.append(indata)
+
+            # Send input if streaming enabled
+            if self.config.stream and len(self.speech_buffer) >= self.min_chunk_size:
+                self._execution_step(speech=self.speech_buffer)
 
         # add vad status outputs to queue
         if vad_output:
@@ -238,40 +250,104 @@ class SpeechToText(ModelComponent):
             frames_per_buffer=self.config._block_size,
             input=True,
             start=True,
-            stream_callback=self._stream_callback,  # type: ignore
+            input_device_index=self.config.device_audio,
+            stream_callback=self.__stream_callback,  # type: ignore
         )
 
         while True:
             vad_output = self.queue.get()
-            if vad_output is VADStatus.START:
-                # When someone starts speaking, check for wakeword if enabled
-                self.get_logger().debug("Speech started")
-                if self.config.enable_wakeword:
-                    self.wake_word(
-                        self.audio_features.get_embeddings(self.wake_word.model_input)
-                    )
-            elif vad_output is VADStatus.ONGOING:
-                self.get_logger().debug("Speech ongoing")
-                if self.config.enable_wakeword:
-                    wake_status = self.wake_word(
-                        self.audio_features.get_embeddings(self.wake_word.model_input)
-                    )
-                    if wake_status is WakeWordStatus.END:
-                        self.get_logger().debug("Wakeword ended")
-                        self.wake_word_triggered = True
-            elif vad_output is VADStatus.END:
-                # Send audio when speech finishes
-                self.get_logger().debug("Speech ended")
-                if self.config.enable_wakeword:
-                    self.wake_word_triggered = False
-                self._execution_step(speech=self.speech_buffer)
-                self.speech_buffer.clear()
+            self.__process_vad_output(vad_output)
             if self.event.is_set():
                 stream.stop_stream()
                 stream.close()
                 audio_interface.terminate()
                 break
         self.event.wait()
+
+    def __process_vad_output(self, vad_output: VADStatus):
+        """Process VAD Status"""
+        if vad_output is VADStatus.START:
+            # When someone starts speaking, check for wakeword if enabled
+            self.get_logger().debug("Speech started")
+            if self.config.enable_wakeword:
+                self.wake_word(
+                    self.audio_features.get_embeddings(self.wake_word.model_input)
+                )
+        elif vad_output is VADStatus.ONGOING:
+            self.get_logger().debug("Speech ongoing")
+            if self.config.enable_wakeword:
+                wake_status = self.wake_word(
+                    self.audio_features.get_embeddings(self.wake_word.model_input)
+                )
+                if wake_status is WakeWordStatus.END:
+                    self.get_logger().debug("Wakeword ended")
+                    self.wake_word_triggered = True
+        elif vad_output is VADStatus.END:
+            # Send audio when speech finishes
+            self.get_logger().debug("Speech ended")
+            if self.config.enable_wakeword:
+                self.wake_word_triggered = False
+            if self.config.stream:
+                # Send again in case last segment was shorter than min_chunk_size
+                self._execution_step(speech=self.speech_buffer)
+                # Send termination token
+                self._execution_step(speech=[b"\r\n"])
+            else:
+                self._execution_step(speech=self.speech_buffer)
+            self.speech_buffer.clear()
+
+    def _handle_websocket_streaming(self) -> Optional[List]:
+        """Handle streaming output from a websocket client"""
+        try:
+            message = self.resp_queue.get(block=True)
+            tokens = msgpack.unpackb(message)
+
+            # if termination token is not received then add to hypothesis
+            if not tokens == b"\r\n":
+                self.transcript_buffer.insert(tokens)
+                if newly_committed_words := self.transcript_buffer.flush():
+                    self.result_partial.extend(newly_committed_words)
+
+            # publish output when termination token resceived
+            else:
+                # Get any last words not currently confirmed in hypothesis
+                if remaining_words := self.transcript_buffer.complete():
+                    self.result_partial.extend(remaining_words)
+                complete_transcript = "".join(i[2] for i in self.result_partial)
+                self.get_logger().debug(complete_transcript)
+                self._publish({"output": complete_transcript})
+                # reset buffers
+                self.result_partial = []
+                self.transcript_buffer.reset()
+
+        except Exception as e:
+            self.get_logger().error(str(e))
+            # raise a fallback trigger via health status
+            self.health_status.set_failure()
+
+    def _create_input(self, *_, **kwargs) -> Optional[Dict[str, Any]]:
+        """Create inference input for SpeechToText models
+        :param args:
+        :param kwargs:
+        :rtype: dict[str, Any]
+        """
+
+        if self.config.enable_vad and (speech := kwargs.get("speech")) is not None:
+            query = b"".join(speech)
+        elif trigger := kwargs.get("topic"):
+            query = self.trig_callbacks[trigger.name].get_output()
+            if query is None or len(query) == 0:
+                return None
+        else:
+            self.get_logger().error(
+                "Trigger topic not found. SpeechToText component needs to be given a valid trigger topic."
+            )
+            return None
+
+        return {
+            "query": query,
+            **self.inference_params,
+        }
 
     def _execution_step(self, *args, **kwargs):
         """_execution_step.
@@ -280,38 +356,31 @@ class SpeechToText(ModelComponent):
         :param kwargs:
         """
         # Check for direct speech before checking for triggers
-        if self.config.enable_vad and kwargs.get("speech"):
+        if self.config.enable_vad and (speech := kwargs.get("speech")):
             self.get_logger().debug(
-                f"Received speech from speech thread: {len(kwargs['speech'])}"
+                f"Received speech from speech thread: {len(speech)}"
             )
-            kwargs["speech"] = b"".join(kwargs["speech"])
-        elif self.run_type is ComponentRunType.EVENT:
-            trigger = kwargs.get("topic")
-            if not trigger:
-                return
+        elif self.run_type is ComponentRunType.EVENT and (
+            trigger := kwargs.get("topic")
+        ):
             self.get_logger().debug(f"Received trigger on topic {trigger.name}")
         else:
-            time_stamp = self.get_ros_time().sec
-            self.get_logger().debug(f"Sending at {time_stamp}")
+            return None
 
         # create inference input
         inference_input = self._create_input(*args, **kwargs)
-        # call model inference
         if not inference_input:
             self.get_logger().warning("Input not received, not calling model inference")
             return
 
-        # conduct inference
-        if self.model_client:
-            result = self.model_client.inference(inference_input)
-            if result:
-                # publish inference result
-                if self.publishers_dict:
-                    for publisher in self.publishers_dict.values():
-                        publisher.publish(**result)
-            else:
-                # raise a fallback trigger via health status
-                self.health_status.set_failure()
+        # call model inference
+        result = self._call_inference(inference_input)
+        if result:
+            # publish inference result
+            self._publish(result)
+        else:
+            # raise a fallback trigger via health status
+            self.health_status.set_failure()
 
     def _warmup(self):
         """Warm up and stat check"""
@@ -323,7 +392,7 @@ class SpeechToText(ModelComponent):
         ) as file:
             file_bytes = file.read()
 
-        inference_input = {"query": file_bytes, **self.config._get_inference_params()}
+        inference_input = {"query": file_bytes, **self.inference_params}
 
         # Run inference once to warm up and once to measure time
         self.model_client.inference(inference_input)
@@ -332,8 +401,13 @@ class SpeechToText(ModelComponent):
         result = self.model_client.inference(inference_input)
         elapsed_time = time.time() - start_time
 
-        self.get_logger().warning(f"Model Output: {result}")
-        self.get_logger().warning(f"Approximate Inference time: {elapsed_time} seconds")
-        self.get_logger().warning(
-            f"RTF: {elapsed_time / 2}"  # audio length, 2 seconds
-        )
+        if result:
+            self.get_logger().warning(f"Model Output: {result['output']}")
+            self.get_logger().warning(
+                f"Approximate Inference time: {elapsed_time} seconds"
+            )
+            self.get_logger().warning(
+                f"RTF: {elapsed_time / 2}"  # audio length, 2 seconds
+            )
+        else:
+            self.get_logger().error("Model inference failed during warmup.")

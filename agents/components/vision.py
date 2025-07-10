@@ -10,12 +10,14 @@ from ..ros import (
     Detections,
     FixedInput,
     Image,
+    RGBD,
     Topic,
     Trackings,
     ROSImage,
     ROSCompressedImage,
 )
-from ..utils import validate_func_args
+from ..utils import validate_func_args, load_model
+from ..utils.vision import LocalVisionModel
 from .model_component import ModelComponent
 from .component_base import ComponentRunType
 
@@ -25,23 +27,20 @@ class Vision(ModelComponent):
     This component performs object detection and tracking on input images and outputs a list of detected objects, along with their bounding boxes and confidence scores.
 
     :param inputs: The input topics for the object detection.
-        This should be a list of Topic objects or FixedInput objects, limited to Image type.
+        This should be a list of Topic objects or FixedInput objects, limited to Image (or RGBD) type.
     :type inputs: list[Union[Topic, FixedInput]]
     :param outputs: The output topics for the object detection.
         This should be a list of Topic objects, Detection and Tracking types are handled automatically.
     :type outputs: list[Topic]
-    :param model_client: The model client for the vision component.
-        This should be an instance of ModelClient.
-    :type model_client: ModelClient
+    :param model_client: Optional model client for the vision component to access remote vision models. If not provided, enable_local_classifier should be set to True in VisionConfig
+        This should be an instance of ModelClient. Defaults to None.
+    :type model_client: Optional[ModelClient]
     :param config: The configuration for the vision component.
         This should be an instance of VisionConfig. If not provided, defaults to VisionConfig().
     :type config: VisionConfig
     :param trigger: The trigger value or topic for the vision component.
         This can be a single Topic object, a list of Topic objects, or a float value for timed components.
     :type trigger: Union[Topic, list[Topic], float]
-    :param callback_group: An optional callback group for the vision component.
-        If provided, this should be a string. Otherwise, it defaults to None.
-    :type callback_group: str
     :param component_name: The name of the vision component.
         This should be a string and defaults to "vision_component".
     :type component_name: str
@@ -68,15 +67,14 @@ class Vision(ModelComponent):
         *,
         inputs: List[Union[Topic, FixedInput]],
         outputs: List[Topic],
-        model_client: ModelClient,
+        model_client: Optional[ModelClient] = None,
         config: Optional[VisionConfig] = None,
         trigger: Union[Topic, List[Topic], float] = 1.0,
         component_name: str,
-        callback_group=None,
         **kwargs,
     ):
         self.config: VisionConfig = config or VisionConfig()
-        self.allowed_inputs = {"Required": [Image]}
+        self.allowed_inputs = {"Required": [[Image, RGBD]]}
         self.handled_outputs = [Detections, Trackings]
 
         self._images: List[Union[np.ndarray, ROSImage, ROSCompressedImage]] = []
@@ -87,17 +85,26 @@ class Vision(ModelComponent):
             model_client,
             self.config,
             trigger,
-            callback_group,
             component_name,
             **kwargs,
         )
-        # check for correct model and setup number of trackers to be initialized if any
-        if model_client.model_type != "VisionModel":
-            raise TypeError(
-                "A vision component can only be started with a Vision Model"
-            )
-        if hasattr(model_client, "_model") and self.model_client._model.setup_trackers:  # type: ignore
-            model_client._model._num_trackers = len(inputs)
+
+        if model_client:
+            # check for correct model and setup number of trackers to be initialized if any
+            if model_client.model_type != "VisionModel":
+                raise TypeError(
+                    "A vision component can only be started with a Vision Model"
+                )
+            if (
+                hasattr(model_client, "_model")
+                and self.model_client._model.setup_trackers  # type: ignore
+            ):
+                model_client._model._num_trackers = len(inputs)
+        else:
+            if not self.config.enable_local_classifier:
+                raise TypeError(
+                    "Vision component either requires a model client or enable_local_classifier needs to be set True in the VisionConfig."
+                )
 
     def custom_on_configure(self):
         # configure parent component
@@ -107,7 +114,18 @@ class Vision(ModelComponent):
         if self.config.enable_visualization:
             self.queue = queue.Queue()
             self.stop_event = threading.Event()
-            self.visualization_thread = threading.Thread(target=self._visualize).start()
+            self.visualization_thread = threading.Thread(target=self._visualize)
+            self.visualization_thread.start()
+
+        # deploy local model if enabled
+        if not self.model_client and self.config.enable_local_classifier:
+            self.local_classifier = LocalVisionModel(
+                model_path=load_model(
+                    "local_classifier", self.config.local_classifier_model_path
+                ),
+                ncpu=self.config.ncpu_local_classifier,
+                device=self.config.device_local_classifier,
+            )
 
     def custom_on_deactivate(self):
         # if visualization is enabled, shutdown the thread
@@ -186,7 +204,7 @@ class Vision(ModelComponent):
             images = []
 
             for i in self.callbacks.values():
-                if (item := i.get_output()) is not None:
+                if (item := i.get_output(clear_last=True)) is not None:
                     images.append(item)
                     if i.msg:
                         self._images.append(i.msg)  # Collect all images for publishing
@@ -194,7 +212,7 @@ class Vision(ModelComponent):
         if not images:
             return None
 
-        return {"images": images, **self.config._get_inference_params()}
+        return {"images": images, **self.inference_params}
 
     def _execution_step(self, *args, **kwargs):
         """_execution_step.
@@ -203,8 +221,7 @@ class Vision(ModelComponent):
         :param kwargs:
         """
 
-        if self.run_type is ComponentRunType.EVENT:
-            trigger = kwargs.get("topic")
+        if self.run_type is ComponentRunType.EVENT and (trigger := kwargs.get("topic")):
             if not trigger:
                 return
             self.get_logger().debug(f"Received trigger on topic {trigger.name}")
@@ -221,22 +238,32 @@ class Vision(ModelComponent):
 
         # conduct inference
         if self.model_client:
-            result = self.model_client.inference(inference_input)
-            # raise a fallback trigger via health status
-            if result:
-                # publish inference result
-                if hasattr(self, "publishers_dict"):
-                    for publisher in self.publishers_dict.values():
-                        publisher.publish(
-                            **result,
-                            images=self._images,
-                            time_stamp=self.get_ros_time(),
-                        )
-                if self.config.enable_visualization:
-                    result["images"] = inference_input["images"]
-                    self.queue.put_nowait(result)
-            else:
-                self.health_status.set_failure()
+            result = self._call_inference(inference_input, unpack=True)
+        elif self.config.enable_local_classifier:
+            result = self.local_classifier(
+                inference_input,
+                self.config.input_height,
+                self.config.input_width,
+                self.config.dataset_labels,
+            )
+        else:
+            raise TypeError(
+                "Vision component either requires a model client or enable_local_classifier needs to be set True in the VisionConfig. If latter was done, make sure no errors occured during initialization of the local classifier model."
+            )
+
+        # raise a fallback trigger via health status
+        if result:
+            # publish inference result
+            self._publish(
+                result,
+                images=self._images,
+                time_stamp=self.get_ros_time(),
+            )
+            if self.config.enable_visualization:
+                result["images"] = inference_input["images"]
+                self.queue.put_nowait(result)
+        else:
+            self.health_status.set_failure()
 
     def _warmup(self):
         """Warm up and stat check"""
@@ -257,17 +284,22 @@ class Vision(ModelComponent):
                 str(Path(__file__).parents[1] / Path("resources/test.jpeg"))
             )
 
-        inference_input = {"images": [image], **self.config._get_inference_params()}
+        inference_input = {"images": [image], **self.inference_params}
 
         # Run inference once to warm up and once to measure time
-        self.model_client.inference(inference_input)
+        if self.model_client:
+            self.model_client.inference(inference_input)
 
         start_time = time.time()
-        result = self.model_client.inference(inference_input)
-        elapsed_time = time.time() - start_time
-
-        self.get_logger().warning(f"Model Output: {result}")
-        self.get_logger().warning(f"Approximate Inference time: {elapsed_time} seconds")
-        self.get_logger().warning(
-            f"Max throughput: {1 / elapsed_time} frames per second"
-        )
+        if self.model_client:
+            result = self.model_client.inference(inference_input)
+            elapsed_time = time.time() - start_time
+            self.get_logger().warning(f"Model Output: {result}")
+            self.get_logger().warning(
+                f"Approximate Inference time: {elapsed_time} seconds"
+            )
+            self.get_logger().warning(
+                f"Max throughput: {1 / elapsed_time} frames per second"
+            )
+        else:
+            result = "Component was run without a client. Did not execute warmup"

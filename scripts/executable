@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
 import argparse
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Tuple
 
 import rclpy
 import setproctitle
@@ -14,7 +14,7 @@ from agents import clients
 from agents.ros import Topic, FixedInput, MapLayer, Route
 
 
-def _parse_args() -> tuple[argparse.Namespace, List[str]]:
+def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
     """Parse arguments."""
     parser = argparse.ArgumentParser(description="Component Executable Config")
     parser.add_argument(
@@ -153,7 +153,7 @@ def _parse_ros_args(args_names: List[str]) -> List[str]:
 
 def main():
     """Executable main function to run a component as a ROS2 node in a new process.
-    Used to start a node using ROS Sugar Launcher. Extends functionality from ROS Sugar
+    Used to start a node using Sugarcoat Launcher. Extends functionality from ROS Sugar
 
     :param list_of_components: List of all known Component classes in the package
     :type list_of_components: List[Type]

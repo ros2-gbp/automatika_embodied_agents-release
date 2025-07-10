@@ -5,17 +5,16 @@ from functools import wraps
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from types import GenericAlias, UnionType
 from typing import (
     List,
     Dict,
     Optional,
     Union,
-    _UnionGenericAlias,
     get_args,
     get_origin,
     _GenericAlias,
 )
+from collections.abc import Iterable
 
 import cv2
 import httpx
@@ -23,8 +22,6 @@ import numpy as np
 from attrs import Attribute
 from jinja2 import Environment, FileSystemLoader
 from jinja2.environment import Template
-from tqdm import tqdm
-from platformdirs import user_cache_dir
 from .pluralize import pluralize
 
 
@@ -47,7 +44,7 @@ def create_detection_context(obj_list: Optional[List]) -> str:
             context_list.append(f"{str(obj_count)} {obj_class}")
 
     if len(obj_list) > 1:
-        return f'{", ".join(context_list)}'
+        return f"{', '.join(context_list)}"
     return f"{context_list[0]}"
 
 
@@ -83,7 +80,7 @@ def get_prompt_template(template: Union[str, Path]) -> Template:
             ) from e
 
 
-def validate_kwargs(_, attribute: Attribute, value: Dict):
+def validate_kwargs_from_default(_, attribute: Attribute, value: Dict):
     """Validate kwargs
     :param attribute:
     :type attribute: Attribute
@@ -119,15 +116,14 @@ def _check_type_from_signature(value, fn_param: inspect.Parameter) -> None:
     :rtype: None
     """
     # Handles only one layer of Union
-    if isinstance(fn_param.annotation, (_UnionGenericAlias, UnionType)):
+    if get_origin(fn_param.annotation) is Union:
         _annotated_types = get_args(fn_param.annotation)
     else:
         _annotated_types = [fn_param.annotation]
 
     # Handles only the origin of GenericAlias (dict, list)
     _annotated_types = [
-        get_origin(t) if isinstance(t, (GenericAlias, _GenericAlias)) else t
-        for t in _annotated_types
+        get_origin(t) if isinstance(t, _GenericAlias) else t for t in _annotated_types
     ]
 
     type_check = any(isinstance(value, t) for t in _annotated_types)
@@ -192,7 +188,7 @@ def validate_func_args(func):
     return wrapper
 
 
-def encode_arr_base64(img: np.ndarray) -> str:
+def encode_img_base64(img: np.ndarray) -> str:
     """Encode a numpy array to a base64 str.
     :param img:
     :type img: np.ndarray
@@ -220,6 +216,10 @@ class WakeWordStatus(Enum):
 
 
 def load_model(model_name: str, model_path: str) -> str:
+    """Model download utility function"""
+    from tqdm import tqdm
+    from platformdirs import user_cache_dir
+
     cachedir = user_cache_dir("ros_agents")
     model_full_path = Path(cachedir) / Path("models") / Path(f"{model_name}.onnx")
 
@@ -260,6 +260,15 @@ def load_model(model_name: str, model_path: str) -> str:
 
     progress_bar.close()
     return str(model_full_path)
+
+
+def flatten(xs):
+    """Generator to flatten lists of arbitrary types"""
+    for x in xs:
+        if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
+            yield from flatten(x)
+        else:
+            yield x
 
 
 class PDFReader:
@@ -321,3 +330,107 @@ class PDFReader:
                 images += page_images
 
         return ids, metadatas, documents
+
+
+_LANGUAGE_CODES = [
+    "af",
+    "am",
+    "ar",
+    "as",
+    "az",
+    "ba",
+    "be",
+    "bg",
+    "bn",
+    "bo",
+    "br",
+    "bs",
+    "ca",
+    "cs",
+    "cy",
+    "da",
+    "de",
+    "el",
+    "en",
+    "es",
+    "et",
+    "eu",
+    "fa",
+    "fi",
+    "fo",
+    "fr",
+    "gl",
+    "gu",
+    "ha",
+    "haw",
+    "he",
+    "hi",
+    "hr",
+    "ht",
+    "hu",
+    "hy",
+    "id",
+    "is",
+    "it",
+    "ja",
+    "jw",
+    "ka",
+    "kk",
+    "km",
+    "kn",
+    "ko",
+    "la",
+    "lb",
+    "ln",
+    "lo",
+    "lt",
+    "lv",
+    "mg",
+    "mi",
+    "mk",
+    "ml",
+    "mn",
+    "mr",
+    "ms",
+    "mt",
+    "my",
+    "ne",
+    "nl",
+    "nn",
+    "no",
+    "oc",
+    "pa",
+    "pl",
+    "ps",
+    "pt",
+    "ro",
+    "ru",
+    "sa",
+    "sd",
+    "si",
+    "sk",
+    "sl",
+    "sn",
+    "so",
+    "sq",
+    "sr",
+    "su",
+    "sv",
+    "sw",
+    "ta",
+    "te",
+    "tg",
+    "th",
+    "tk",
+    "tl",
+    "tr",
+    "tt",
+    "uk",
+    "ur",
+    "uz",
+    "vi",
+    "yi",
+    "yo",
+    "zh",
+    "yue",
+]
