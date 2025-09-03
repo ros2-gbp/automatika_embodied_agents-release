@@ -2,7 +2,7 @@
 
 While semantic routing can be implemented with an LLM component, _EmbodiedAgents_ also provides a convenient SemanticRouter component that works directly with text encoding distances and can be utilized with a vector DB.
 
-In this example we will use the SemanticRouter component to route text queries between two components, a general purpose LLM and a Go-to-X component that we built in the previous [example](goto.md). Lets start by setting up our components.
+In this recipe we will use the SemanticRouter component to route text queries between two components, a general purpose LLM and a Go-to-X component that we built in the previous [example](goto.md). Lets start by setting up our components.
 
 ## Setting up the components
 
@@ -19,7 +19,7 @@ from agents.config import LLMConfig, SemanticRouterConfig
 from agents.clients import ChromaClient, OllamaClient
 from agents.ros import Launcher, Topic, Route
 
-# Start a Llama3.1 based llm component using ollama client
+# Start a Llama3.2 based llm component using ollama client
 llama = OllamaModel(name="llama", checkpoint="llama3.2:3b")
 llama_client = OllamaClient(llama)
 
@@ -28,7 +28,7 @@ chroma = ChromaDB()
 chroma_client = ChromaClient(db=chroma)
 
 
-# Make a generic LLM component using the Llama3_1 model
+# Make a generic LLM component using the Llama3_2 model
 llm_in = Topic(name="text_in_llm", msg_type="String")
 llm_out = Topic(name="text_out_llm", msg_type="String")
 
@@ -40,7 +40,7 @@ llm = LLM(
     component_name="generic_llm",
 )
 
-# Make a Go-to-X component using the same Llama3_1 model
+# Make a Go-to-X component using the same Llama3_2 model
 goto_in = Topic(name="goto_in", msg_type="String")
 goal_point = Topic(name="goal_point", msg_type="PoseStamped")
 
@@ -150,7 +150,7 @@ from agents.config import LLMConfig, SemanticRouterConfig
 from agents.clients import ChromaClient, OllamaClient
 from agents.ros import Launcher, Topic, Route
 
-# Start a Llama3.1 based llm component using ollama client
+# Start a Llama3.2 based llm component using ollama client
 llama = OllamaModel(name="llama", checkpoint="llama3.2:3b")
 llama_client = OllamaClient(llama)
 
@@ -159,7 +159,7 @@ chroma = ChromaDB()
 chroma_client = ChromaClient(db=chroma)
 
 
-# Make a generic LLM component using the Llama3_1 model
+# Make a generic LLM component using the Llama3_2 model
 llm_in = Topic(name="text_in_llm", msg_type="String")
 llm_out = Topic(name="text_out_llm", msg_type="String")
 
