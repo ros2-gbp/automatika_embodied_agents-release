@@ -31,18 +31,25 @@ from ros_sugar.core.component import MutuallyExclusiveCallbackGroup
 from ros_sugar import Launcher
 from ros_sugar.utils import component_action
 
-# LEIBNIZ TYPES
+# AGENTS TYPES
 from automatika_embodied_agents.msg import Point2D, Bbox2D, Detection2D, Detections2D
 from automatika_embodied_agents.msg import (
+    StreamingString as ROSStreamingString,
     Video as ROSVideo,
     Tracking as ROSTracking,
     Trackings as ROSTrackings,
     PointsOfInterest as ROSPointsOfInterest,
 )
-from .callbacks import ObjectDetectionCallback, RGBDCallback, VideoCallback
+from .callbacks import (
+    ObjectDetectionCallback,
+    RGBDCallback,
+    VideoCallback,
+    TextCallback,
+)
 
 __all__ = [
     "String",
+    "StreamingString",
     "Audio",
     "Image",
     "CompressedImage",
@@ -63,8 +70,33 @@ __all__ = [
 ]
 
 
+class StreamingString(SupportedType):
+    """Custom Message: StreamingString"""
+
+    callback = TextCallback
+    _ros_type = ROSStreamingString
+
+    @classmethod
+    def convert(
+        cls,
+        output: str,
+        stream: bool = False,
+        done: bool = True,
+        **_,
+    ) -> ROSStreamingString:
+        """
+        Takes a string and streaming info to return a streaming string custom msg
+        :return: ROSStreamingString
+        """
+        msg = ROSStreamingString()
+        msg.stream = stream
+        msg.done = done
+        msg.data = output
+        return msg
+
+
 class Video(SupportedType):
-    """Video."""
+    """Custom Message: Video."""
 
     _ros_type = ROSVideo
     callback = VideoCallback
@@ -93,20 +125,33 @@ class Video(SupportedType):
 
 
 class Detection(SupportedType):
-    """Detection."""
+    """Custom Message: Detection."""
 
     _ros_type = Detection2D
     callback = None  # not defined
 
     @classmethod
     def convert(
-        cls, output: Dict, img: Union[ROSImage, ROSCompressedImage, np.ndarray], **_
+        cls,
+        output: Union[Dict, List[Dict]],
+        images: Union[
+            ROSImage,
+            ROSCompressedImage,
+            np.ndarray,
+            List[ROSImage],
+            List[ROSCompressedImage],
+            List[np.ndarray],
+        ],
+        **_,
     ) -> Detection2D:
         """
         Takes object detection data and converts it into a ROS message
         of type Detection2D
         :return: Detection2D
         """
+        if isinstance(output, List):
+            output = output[0]
+            images = images[0] if images else []
         msg = Detection2D()
         msg.scores = output["scores"]
         msg.labels = output["labels"]
@@ -120,19 +165,20 @@ class Detection(SupportedType):
             boxes.append(box)
 
         msg.boxes = boxes
-        if isinstance(img, ROSCompressedImage):
-            msg.compressed_image = CompressedImage.convert(img)
-        # Handle RealSense RGBD msgs
-        elif hasattr(img, "depth"):
-            msg.image = Image.convert(img.rgb)
-            msg.depth = Image.convert(img.depth)
-        else:
-            msg.image = Image.convert(img)
+        if images:
+            if isinstance(images, ROSCompressedImage):
+                msg.compressed_image = CompressedImage.convert(images)
+            # Handle RealSense RGBD msgs
+            elif hasattr(images, "depth"):
+                msg.image = Image.convert(images.rgb)
+                msg.depth = Image.convert(images.depth)
+            else:
+                msg.image = Image.convert(images)
         return msg
 
 
 class Detections(SupportedType):
-    """Detections."""
+    """Custom Message: Detections."""
 
     _ros_type = Detections2D
     callback = ObjectDetectionCallback
@@ -153,7 +199,7 @@ class Detections(SupportedType):
 
 
 class PointsOfInterest(SupportedType):
-    """PointsOfInterest."""
+    """Custom Message: PointsOfInterest."""
 
     _ros_type = ROSPointsOfInterest
     callback = None  # not defined
@@ -191,20 +237,33 @@ class PointsOfInterest(SupportedType):
 
 
 class Tracking(SupportedType):
-    """Tracking."""
+    """Custom Message: Tracking."""
 
     _ros_type = ROSTracking
     callback = None  # Not defined in EmbodiedAgents
 
     @classmethod
     def convert(
-        cls, output: Dict, img: Union[ROSImage, ROSCompressedImage, np.ndarray], **_
+        cls,
+        output: Union[Dict, List[Dict]],
+        images: Union[
+            ROSImage,
+            ROSCompressedImage,
+            np.ndarray,
+            List[ROSImage],
+            List[ROSCompressedImage],
+            List[np.ndarray],
+        ],
     ) -> ROSTracking:
         """
         Takes tracking data and converts it into a ROS message
         of type Tracking
         :return: ROSTracking
         """
+        # Only consider the first datapoint if a list is sent
+        if isinstance(output, List):
+            output = output[0]
+            images = images[0]
         msg = ROSTracking()
         msg.ids = output.get("ids") or []
         msg.labels = output.get("tracked_labels") or []
@@ -237,19 +296,19 @@ class Tracking(SupportedType):
         msg.boxes = tracked_boxes
         msg.centroids = centroids
         msg.estimated_velocities = estimated_velocities
-        if isinstance(img, ROSCompressedImage):
-            msg.compressed_image = CompressedImage.convert(img)
+        if isinstance(images, ROSCompressedImage):
+            msg.compressed_image = CompressedImage.convert(images)
         # Handle RealSense RGBD msgs
-        elif hasattr(img, "depth"):
-            msg.image = Image.convert(img.rgb)
-            msg.depth = Image.convert(img.depth)
+        elif hasattr(images, "depth"):
+            msg.image = Image.convert(images.rgb)
+            msg.depth = Image.convert(images.depth)
         else:
-            msg.image = Image.convert(img)
+            msg.image = Image.convert(images)
         return msg
 
 
 class Trackings(SupportedType):
-    """Trackings."""
+    """Custom Message: Trackings."""
 
     _ros_type = ROSTrackings
     callback = None  # Not defined
@@ -270,7 +329,7 @@ class Trackings(SupportedType):
 
 
 class RGBD(SupportedType):
-    """Adds callback for automatika_embodied_agents/msg/Detections2D message"""
+    """Adds callback for realsense2 aligned rgb and depth msg (rgbd)"""
 
     callback = RGBDCallback
 
@@ -286,13 +345,14 @@ class RGBD(SupportedType):
 
 
 agent_types = [
+    StreamingString,
     Video,
     Detection,
     Detections,
     Tracking,
     Trackings,
-    RGBD,
     PointsOfInterest,
+    RGBD,
 ]
 
 
