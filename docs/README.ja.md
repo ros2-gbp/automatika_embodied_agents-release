@@ -17,7 +17,7 @@
 
 [インストール手順](https://automatika-robotics.github.io/embodied-agents/installation.html) 🛠️
 [クイックスタートガイド](https://automatika-robotics.github.io/embodied-agents/quickstart.html) 🚀
-[基本概念](https://automatika-robotics.github.io/embodied-agents/basics.html) 📚
+[基本概念](https://automatika-robotics.github.io/embodied-agents/basics/index.html) 📚
 [サンプル集](https://automatika-robotics.github.io/embodied-agents/examples/index.html) ✨
 
 ## インストール 🛠️
@@ -51,7 +51,7 @@ pip install 'attrs>=23.2.0'
 #### 依存関係の取得
 
 ```bash
-pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm
+pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm websockets
 ```
 
 Sugarcoat🍬 をクローン：
@@ -76,27 +76,33 @@ _EmbodiedAgents_ は、他の ROS パッケージと異なり、[Sugarcoat🍬](
 
 ```python
 from agents.clients.ollama import OllamaClient
-from agents.components import MLLM
+from agents.components import VLM
 from agents.models import OllamaModel
 from agents.ros import Topic, Launcher
 
+# Define input and output topics (pay attention to msg_type)
 text0 = Topic(name="text0", msg_type="String")
 image0 = Topic(name="image_raw", msg_type="Image")
 text1 = Topic(name="text1", msg_type="String")
 
+# Define a model client (working with Ollama in this case)
+# OllamaModel is a generic wrapper for all Ollama models
 llava = OllamaModel(name="llava", checkpoint="llava:latest")
 llava_client = OllamaClient(llava)
 
-mllm = MLLM(
+# Define a VLM component (A component represents a node with a particular functionality)
+mllm = VLM(
     inputs=[text0, image0],
     outputs=[text1],
     model_client=llava_client,
     trigger=[text0],
     component_name="vqa"
 )
+# Additional prompt settings
 mllm.set_topic_prompt(text0, template="""You are an amazing and funny robot.
     Answer the following about this image: {{ text0 }}"""
 )
+# Launch the component
 launcher = Launcher()
 launcher.add_pkg(components=[mllm])
 launcher.bringup()
@@ -113,6 +119,27 @@ launcher.bringup()
   <source media="(prefers-color-scheme: light)" srcset="_static/complete_light.png">
   <img alt="高度なエージェント" src="_static/complete_dark.png">
 </picture>
+
+## EmbodiedAgentレシピの動的Web UI
+
+基盤となる[**Sugarcoat**](https://github.com/automatika-robotics/sugarcoat)フレームワークの強力な機能を活用し、***EmbodiedAgents***は各レシピに対して**完全に動的で自動生成されるWeb UI**を提供します。
+この機能は**FastHTML**によって構築されており、手動でのGUI開発を不要にし、制御や可視化のためのレスポンシブなインターフェースを即座に提供します。
+
+このUIは自動的に以下を生成します：
+
+* レシピ内で使用されるすべてのコンポーネントに対する設定インターフェース
+* コンポーネントの入出力に対するリアルタイムデータの可視化と制御
+* すべての対応メッセージ型に対するWebSocketベースのデータストリーミング
+
+### 例：VLMエージェントUI
+
+VLM Q&Aエージェント（クイックスタート例と類似）のための完全なインターフェースが自動生成され、設定用のシンプルなコントロールやリアルタイムのテキスト入出力表示を提供します。
+
+<p align="center">
+<picture align="center">
+  <img alt="EmbodiedAgents UI Example GIF" src="docs/_static/agents_ui.gif" width="60%">
+</picture>
+</p>
 
 ## 著作権情報
 
