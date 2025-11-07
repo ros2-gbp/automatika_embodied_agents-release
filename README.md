@@ -19,7 +19,7 @@ Checkout [Installation Instructions](https://automatika-robotics.github.io/embod
 
 Get started with the [Quickstart Guide](https://automatika-robotics.github.io/embodied-agents/quickstart.html) 🚀
 
-Get familiar with [Basic Concepts](https://automatika-robotics.github.io/embodied-agents/basics.html) 📚
+Get familiar with [Basic Concepts](https://automatika-robotics.github.io/embodied-agents/basics/index.html) 📚
 
 Dive right in with [Example Recipes](https://automatika-robotics.github.io/embodied-agents/examples/index.html) ✨
 
@@ -50,7 +50,7 @@ If the attrs version from your package manager is < 23.2, install it using pip a
 Install python dependencies
 
 ```shell
-pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm
+pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm websockets
 ```
 
 Download Sugarcoat🍬
@@ -71,11 +71,11 @@ python your_script.py
 
 ## Quick Start 🚀
 
-Unlike other ROS package, _EmbodiedAgents_ provides a pure pythonic way of describing the node graph using [Sugarcoat🍬](https://www.github.com/automatika-robotics/sugarcoat). Copy the following code in a python script and run it.
+Unlike other ROS package, _EmbodiedAgents_ provides a pure pythonic way of describing the node graph using [Sugarcoat🍬](https://www.github.com/automatika-robotics/sugarcoat). Copy the following recipe in a python script and run it.
 
 ```python
 from agents.clients.ollama import OllamaClient
-from agents.components import MLLM
+from agents.components import VLM
 from agents.models import OllamaModel
 from agents.ros import Topic, Launcher
 
@@ -85,11 +85,12 @@ image0 = Topic(name="image_raw", msg_type="Image")
 text1 = Topic(name="text1", msg_type="String")
 
 # Define a model client (working with Ollama in this case)
+# OllamaModel is a generic wrapper for all Ollama models
 llava = OllamaModel(name="llava", checkpoint="llava:latest")
 llava_client = OllamaClient(llava)
 
-# Define an MLLM component (A component represents a node with a particular functionality)
-mllm = MLLM(
+# Define a VLM component (A component represents a node with a particular functionality)
+mllm = VLM(
     inputs=[text0, image0],
     outputs=[text1],
     model_client=llava_client,
@@ -106,7 +107,7 @@ launcher.add_pkg(components=[mllm])
 launcher.bringup()
 ```
 
-And just like that we have an agent that can answer questions like **'What do you see?'**. To interact with this agent, _EmbodiedAgents_ includes a tiny web client. Checkout the [Quick Start Guide](https://automatika-robotics.github.io/embodied-agents/quickstart.html) to learn more about how components and models work together.
+And just like that we have an agent that can answer questions like **'What do you see?'**. Checkout the [Quick Start Guide](https://automatika-robotics.github.io/embodied-agents/quickstart.html) to learn more about how components and models work together.
 
 ## Complex Physical Agents
 
@@ -117,6 +118,25 @@ The quickstart example above is just an amuse-bouche of what is possible with _E
   <source media="(prefers-color-scheme: light)" srcset="docs/_static/complete_light.png">
   <img alt="Elaborate Agent" src="docs/_static/complete_dark.png">
 </picture>
+
+## Dynamic Web UI for EmbodiedAgent Recipes
+
+Leveraging the power of the underlying [**Sugarcoat**](https://github.com/automatika-robotics/sugarcoat) framework, **_EmbodiedAgents_** offers a **fully dynamic, auto-generated Web UI** for every recipe. This feature is built with **FastHTML** and eliminates manual GUI development, instantly providing a responsive interface for control and visualization.
+
+The UI automatically creates:
+* Settings interfaces for all the components used in the recipe.
+* Real-time data visualizations and controls for component inputs/outputs.
+* WebSocket-based data streaming for all supported message types.
+
+### Example: VLM Agent UI
+
+A full interface is automatically generated for a VLM Q\&A agent (similat to the Quick Start example), providing simple controls for settings and displaying real-time text input/output.
+
+<p align="center">
+<picture align="center">
+  <img alt="EmbodiedAgents UI Example GIF" src="docs/_static/agents_ui.gif" width="60%">
+</picture>
+</p>
 
 ## Copyright
 
