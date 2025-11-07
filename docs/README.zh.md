@@ -17,7 +17,7 @@
 
 查看 [安装说明](https://automatika-robotics.github.io/embodied-agents/installation.html) 🛠️
 立即开始 [快速上手](https://automatika-robotics.github.io/embodied-agents/quickstart.html) 🚀
-了解 [基本概念](https://automatika-robotics.github.io/embodied-agents/basics.html) 📚
+了解 [基本概念](https://automatika-robotics.github.io/embodied-agents/basics/index.html) 📚
 参考 [示例代码](https://automatika-robotics.github.io/embodied-agents/examples/index.html) ✨
 
 ## 安装 🛠️
@@ -45,7 +45,7 @@ _EmbodiedAgents_ 的核心与具体的模型部署平台无关。目前支持的
 #### 安装依赖项
 
 ```bash
-pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm
+pip install numpy opencv-python-headless 'attrs>=23.2.0' jinja2 httpx setproctitle msgpack msgpack-numpy platformdirs tqdm websockets
 ```
 
 克隆 Sugarcoat🍬：
@@ -70,27 +70,33 @@ python your_script.py
 
 ```python
 from agents.clients.ollama import OllamaClient
-from agents.components import MLLM
+from agents.components import VLM
 from agents.models import OllamaModel
 from agents.ros import Topic, Launcher
 
+# Define input and output topics (pay attention to msg_type)
 text0 = Topic(name="text0", msg_type="String")
 image0 = Topic(name="image_raw", msg_type="Image")
 text1 = Topic(name="text1", msg_type="String")
 
+# Define a model client (working with Ollama in this case)
+# OllamaModel is a generic wrapper for all Ollama models
 llava = OllamaModel(name="llava", checkpoint="llava:latest")
 llava_client = OllamaClient(llava)
 
-mllm = MLLM(
+# Define a VLM component (A component represents a node with a particular functionality)
+mllm = VLM(
     inputs=[text0, image0],
     outputs=[text1],
     model_client=llava_client,
     trigger=[text0],
     component_name="vqa"
 )
+# Additional prompt settings
 mllm.set_topic_prompt(text0, template="""You are an amazing and funny robot.
     Answer the following about this image: {{ text0 }}"""
 )
+# Launch the component
 launcher = Launcher()
 launcher.add_pkg(components=[mllm])
 launcher.bringup()
@@ -107,6 +113,27 @@ launcher.bringup()
   <source media="(prefers-color-scheme: light)" srcset="_static/complete_light.png">
   <img alt="Elaborate Agent" src="_static/complete_dark.png">
 </picture>
+
+## EmbodiedAgent 配方的动态网页界面
+
+借助底层 [**Sugarcoat**](https://github.com/automatika-robotics/sugarcoat) 框架的强大功能，***EmbodiedAgents*** 为每个配方提供了一个**完全动态、自动生成的网页界面（Web UI）**。
+该功能基于 **FastHTML** 构建，彻底消除了手动开发图形界面的需求，并能即时提供一个用于控制和可视化的响应式界面。
+
+该界面会自动生成以下内容：
+
+* 配方中所使用的所有组件的设置界面
+* 组件输入/输出的实时数据可视化与控制
+* 针对所有支持的消息类型的基于 WebSocket 的数据流传输
+
+### 示例：VLM Agent 界面
+
+系统会为 VLM 问答（Q&A）代理（类似快速入门示例）自动生成完整的界面，提供简洁的设置控制，并显示实时的文本输入/输出。
+
+<p align="center">
+<picture align="center">
+  <img alt="EmbodiedAgents UI Example GIF" src="docs/_static/agents_ui.gif" width="60%">
+</picture>
+</p>
 
 ## 版权信息
 
