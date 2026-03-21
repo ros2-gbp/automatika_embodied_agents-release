@@ -121,6 +121,10 @@ class Vision(ModelComponent):
                 )
 
     def custom_on_configure(self):
+        # deploy local model if enabled
+        if not self.model_client and self.config.enable_local_classifier:
+            self._deploy_local_model()
+
         # configure parent component
         super().custom_on_configure()
 
@@ -131,23 +135,31 @@ class Vision(ModelComponent):
             self.visualization_thread = threading.Thread(target=self._visualize)
             self.visualization_thread.start()
 
-        # deploy local model if enabled
-        if not self.model_client and self.config.enable_local_classifier:
-            from ..utils.vision import LocalVisionModel, _MS_COCO_LABELS
+    def _deploy_local_model(self):
+        """Deploy local vision model on demand."""
+        if self.local_model is not None:
+            return  # already deployed
+        from ..utils.local_vision import LocalVisionModel, _MS_COCO_LABELS
 
-            if not self.config.dataset_labels:
-                self.get_logger().warning(
-                    "No dataset labels provided for the local model, using default MS_COCO labels"
-                )
-                self.config.dataset_labels = _MS_COCO_LABELS
-
-            self.local_classifier = LocalVisionModel(
-                model_path=load_model(
-                    "local_classifier", self.config.local_classifier_model_path
-                ),
-                ncpu=self.config.ncpu_local_classifier,
-                device=self.config.device_local_classifier,
+        if not self.config.dataset_labels:
+            self.get_logger().warning(
+                "No dataset labels provided for the local model, using default MS_COCO labels"
             )
+            self.config.dataset_labels = _MS_COCO_LABELS
+
+        # Auto-enable config flag
+        self.config.enable_local_classifier = True
+
+        self.local_model = LocalVisionModel(
+            model_path=load_model(
+                "local_classifier", self.config.local_classifier_model_path
+            ),
+            ncpu=self.config.ncpu_local_classifier,
+            device=self.config.device_local_classifier,
+            input_height=self.config.input_height,
+            input_width=self.config.input_width,
+            dataset_labels=self.config.dataset_labels,
+        )
 
     def custom_on_deactivate(self):
         # if visualization is enabled, shutdown the thread
@@ -185,23 +197,36 @@ class Vision(ModelComponent):
         :raises ValueError: If the provided topic_name is not found in inputs.
         """
         try:
+            # Preflight check for timed components
+            if (
+                self.run_type == ComponentRunType.TIMED
+                and (loop_time := 1 / self.config.loop_rate) > timeout
+            ):
+                self.get_logger().warning(
+                    f"Warning: take_picture timeout ({timeout}s) is strictly shorter than the component's trigger period ({loop_time}s) for this timed component. "
+                    f"The action is highly likely to timeout before the image callback executes. Consider running the component faster or increasing the timeout for this action."
+                )
             # Expand user path
             save_path = os.path.expanduser(save_path)
             os.makedirs(save_path, exist_ok=True)
 
             # Identify callback type
-            is_trigger = (
-                hasattr(self, "trig_callbacks") and topic_name in self.trig_callbacks
+            trig_dict = getattr(self, "trig_callbacks", {})
+            target_callback = trig_dict.get(topic_name) or self.callbacks.get(
+                topic_name
             )
-            if is_trigger:
-                target_callback = self.trig_callbacks[topic_name]
-            elif topic_name in self.callbacks:
-                target_callback = self.callbacks[topic_name]
-            else:
-                raise ValueError(
+            if not target_callback:
+                self.get_logger().error(
                     f"Topic '{topic_name}' is not one of the component inputs. You can only take pictures on topics that are provided as inputs to this component."
                 )
+                return False
 
+            # if target is a trigger, issue a warning
+            is_trigger = topic_name in trig_dict
+            if is_trigger:
+                self.get_logger().warning(
+                    f"Capturing image from trigger '{topic_name}'. Inference paused momentarily."
+                )
             # save callback state
             original_callback = target_callback._extra_callback
             original_get_processed = target_callback._get_processed
@@ -216,11 +241,6 @@ class Vision(ModelComponent):
 
             # Swap extracallback, wait and restore
             try:
-                if is_trigger:
-                    self.get_logger().warning(
-                        f"Capturing image from trigger '{topic_name}'. Inference paused momentarily."
-                    )
-
                 target_callback.on_callback_execute(
                     single_frame_interceptor, get_processed=True
                 )
@@ -231,11 +251,7 @@ class Vision(ModelComponent):
 
             finally:
                 # Always restore the original callback state
-                if is_trigger:
-                    target_callback.on_callback_execute(
-                        self._execution_step, get_processed=False
-                    )
-                elif original_callback is not None:
+                if original_callback:
                     target_callback.on_callback_execute(
                         original_callback, get_processed=original_get_processed
                     )
@@ -292,21 +308,40 @@ class Vision(ModelComponent):
         :raises ValueError: If the topic_name is not registered.
         """
         try:
+            # Preflight checks for timed components
+            if self.run_type == ComponentRunType.TIMED:
+                if self.config.loop_rate < fps:
+                    self.get_logger().warning(
+                        f"Warning: Requested {fps} FPS, but the component's trigger period is {1 / self.config.loop_rate}s "
+                        f"(~{self.config.loop_rate:.2f} FPS max). The recorded video will heavily repeat frames or play too fast. Consider running the component faster or reduce the fps"
+                    )
+
+                if duration < 1 / self.config.loop_rate:
+                    self.get_logger().warning(
+                        f"Warning: Recording duration ({duration}s) is shorter than the component's loop period "
+                        f"({1 / self.config.loop_rate}s). You are likely to capture 0 frames. Consider running the component faster or increase duration."
+                    )
             # Expand user path
             save_path = os.path.expanduser(save_path)
             os.makedirs(save_path, exist_ok=True)
 
-            # Identify callback type
-            is_trigger = (
-                hasattr(self, "trig_callbacks") and topic_name in self.trig_callbacks
+            trig_dict = getattr(self, "trig_callbacks", {})
+            target_callback = trig_dict.get(topic_name) or self.callbacks.get(
+                topic_name
             )
-            if is_trigger:
-                target_callback = self.trig_callbacks[topic_name]
-            elif topic_name in self.callbacks:
-                target_callback = self.callbacks[topic_name]
-            else:
-                raise ValueError(
+            # Identify callback type
+            if not target_callback:
+                self.get_logger().error(
                     f"Topic '{topic_name}' is not one of the component inputs. You can only record videos on topics that are provided as inputs to this component."
+                )
+                return False
+
+            # if target is a trigger, issue a warning
+            is_trigger = topic_name in trig_dict
+            if is_trigger:
+                self.get_logger().warning(
+                    f"Recording video on trigger topic '{topic_name}'. "
+                    f"Detection or tracking will be PAUSED for {duration} seconds!"
                 )
 
             # Spawn the background thread
@@ -351,12 +386,6 @@ class Vision(ModelComponent):
         original_callback = target_callback._extra_callback
         original_get_processed = target_callback._get_processed
 
-        if is_trigger:
-            self.get_logger().warning(
-                f"Recording video on trigger topic '{topic_name}'. "
-                f"Detection or tracking will be PAUSED for {duration} seconds!"
-            )
-
         # extra callback for capturing images
         def frame_interceptor(msg, topic, output=None):
             if output is not None:
@@ -367,17 +396,14 @@ class Vision(ModelComponent):
             time.sleep(duration)
         finally:
             # Safely restore execution step or original state
-            if is_trigger:
-                target_callback.on_callback_execute(
-                    self._execution_step, get_processed=False
-                )
-                self.get_logger().info(
-                    f"Video recording finished. Vision inference RESUMED on '{topic_name}'."
-                )
-            elif original_callback is not None:
+            if original_callback:
                 target_callback.on_callback_execute(
                     original_callback, get_processed=original_get_processed
                 )
+                if is_trigger:
+                    self.get_logger().info(
+                        f"Video recording finished. Vision inference RESUMED on '{topic_name}'."
+                    )
             else:
                 target_callback._extra_callback = None
 
@@ -500,25 +526,9 @@ class Vision(ModelComponent):
             return
 
         # conduct inference
-        if self.model_client:
-            result = self._call_inference(inference_input, unpack=True)
-            if not result:
-                return
-        elif self.config.enable_local_classifier:
-            result = self.local_classifier(
-                inference_input,
-                self.config.input_height,
-                self.config.input_width,
-                self.config.dataset_labels,
-            )
-            if not result:
-                # raise a fallback trigger via health status
-                self.health_status.set_fail_algorithm()
-                return
-        else:
-            raise TypeError(
-                "Vision component either requires a model client or enable_local_classifier needs to be set True in the VisionConfig. If latter was done, make sure no errors occurred during initialization of the local classifier model."
-            )
+        result = self._call_inference(inference_input, unpack=True)
+        if not result:
+            return
 
         # result acquired, publish inference result
         self._publish(
@@ -554,10 +564,22 @@ class Vision(ModelComponent):
         # Run inference once to warm up and once to measure time
         if self.model_client:
             self.model_client.inference(inference_input)
+        elif self.local_model:
+            self.local_model(inference_input)
 
         start_time = time.time()
         if self.model_client:
             result = self.model_client.inference(inference_input)
+            elapsed_time = time.time() - start_time
+            self.get_logger().warning(f"Model Output: {result}")
+            self.get_logger().warning(
+                f"Approximate Inference time: {elapsed_time} seconds"
+            )
+            self.get_logger().warning(
+                f"Max throughput: {1 / elapsed_time} frames per second"
+            )
+        elif self.local_model:
+            result = self.local_model(inference_input)
             elapsed_time = time.time() - start_time
             self.get_logger().warning(f"Model Output: {result}")
             self.get_logger().warning(
