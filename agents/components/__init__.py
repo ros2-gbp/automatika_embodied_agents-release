@@ -20,7 +20,7 @@ A Component is the main execution unit in _EmbodiedAgents_ and in essence each c
   - Converts spoken audio into text using speech-to-text models (e.g., Whisper). Suitable for voice command recognition. It also implements small on-board models for Voice Activity Detection (VAD) and Wakeword recognition, using audio capture devices onboard the robot.
 
 * - **[TextToSpeech](agents.components.texttospeech.md)**
-  - Synthesizes audio from text using TTS models (e.g., SpeechT5, Bark). Output audio can be played using the robot's speakers or published to a topic. Implements `say(text)` and `stop_playback` functions to play/stop audio based on events from other components or the environment.
+  - Synthesizes audio from text using TTS models (e.g., TransformersTTS). Output audio can be played using the robot's speakers or published to a topic. Implements `say(text)` and `stop_playback` functions to play/stop audio based on events from other components or the environment.
 
 * - **[MapEncoding](agents.components.map_encoding.md)**
   - Provides a spatio-temporal working memory by converting semantic outputs (e.g., from MLLMs or Vision) into a structured map representation. Uses robot localization data and output topics from other components to store information in a vector DB.
@@ -31,12 +31,16 @@ A Component is the main execution unit in _EmbodiedAgents_ and in essence each c
 * - **[Vision](agents.components.vision.md)**
   - An essential component in all vision powered robots. Performs object detection and tracking on incoming images. Outputs object classes, bounding boxes, and confidence scores. It implements a low-latency small on-board classification model as well.
 
+* - **[Cortex](agents.components.cortex.md)**
+  - An LLM-powered high level cognitive component that combines the roll of a long term task planner and executor and also serves as the system monitor. Receives high-level natural language goals, decomposes them into steps by inspecting available components, and executes them with per-step confirmation. Automatically discovers component actions and ROS entrypoints as callable tools.
+
 * - **[VideoMessageMaker](agents.components.imagestovideo.md)**
   - This component generates ROS video messages from input image messages. A video message is a collection of image messages that have a perceivable motion. I.e. the primary task of this component is to make intentionality decisions about what sequence of consecutive images should be treated as one coherent temporal sequence. The chunking method used for selecting images for a video can be configured in component config. It can be useful in sending videos to ML models that take image sequences.
 ```
 """
 
 from .component_base import Component
+from .cortex import Cortex
 from .imagestovideo import VideoMessageMaker
 from .llm import LLM
 from .map_encoding import MapEncoding
@@ -50,6 +54,7 @@ from .vla import VLA
 
 __all__ = [
     "Component",
+    "Cortex",
     "ModelComponent",
     "MapEncoding",
     "MLLM",
