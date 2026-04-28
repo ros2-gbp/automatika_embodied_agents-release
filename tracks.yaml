@@ -104,5 +104,4 @@ tracks:
     ros_distro: rolling
     vcs_type: git
     vcs_uri: https://github.com/automatika-robotics/ros-agents.git
-    version: 0.7.0
-    version_saved: :{auto}
+    version: :{auto}
