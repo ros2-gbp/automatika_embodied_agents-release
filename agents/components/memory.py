@@ -311,8 +311,9 @@ class Memory(Component):
             ) from e
 
         all_topics = [layer.subscribes_to for layer in layers] + [self.config._position]
+        parsed_topics = self._reparse_inputs_callbacks(all_topics)
         self.callbacks = {
-            input.name: input.msg_type.callback(input) for input in all_topics
+            input.name: input.msg_type.callback(input) for input in parsed_topics
         }
 
     def _store_layers(self, position, time_stamp) -> None:
@@ -650,10 +651,26 @@ class Memory(Component):
         memory.register_tools_on(llm, tools=["semantic_search", "locate", "get_current_context"])
         ```
         """
-        for fn, desc in self.memory.get_tools_for_registration():
-            name = desc["function"]["name"]
-            if tools is None or name in tools:
-                llm.register_tool(fn, desc, send_tool_response_to_model)
+        # Build the descriptions from the static schemas and defer the dispatch
+        # lookup to call time so registration works before the lifecycle has run
+        for tool_name, _ in _EMEM_TOOL_SCHEMAS.items():
+            if tools is not None and tool_name not in tools:
+                continue
+            desc = _tool(tool_name)
+
+            def _make_dispatch(name):
+                def _dispatch(**kwargs):
+                    return self.memory.dispatch_tool_call(name, kwargs)
+
+                _dispatch.__name__ = name
+                # Add memory component as self so LLM knows its a component
+                # method
+                _dispatch.__self__ = self
+                return _dispatch
+
+            llm.register_tool(
+                _make_dispatch(tool_name), desc, send_tool_response_to_model
+            )
 
     def _update_cmd_args_list(self):
         """
