@@ -2,6 +2,37 @@
 Changelog for package automatika_embodied_agents
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.4 (2026-06-05)
+------------------
+* (chore) Bumps up sugarcoat version
+* (refactor) Adds build url helper for building url schema if none provided
+* (fix) Allows say method to raise exceptions to be handled by parent 'execute_method' and fixes attribute check
+* (feature) Adds robot plugin serialization/deserialization to the executable
+* (fix) Adds using pre-init logger in methods executed before activation
+* (fix) Fixes an error where TLS endpoints couldnt be called by clients
+* (feature) Adds plugin actions to actions available to cortex and augments planning prompt with robot description from the plugin
+* Contributors: ahr, mkabtoul
+
+0.7.3 (2026-05-08)
+------------------
+* (fix) Fixes the helper method typo
+* (fix) Fixes validate topics check to include comparing the associated ROS2 message type, resolves `#30 <https://github.com/automatika-robotics/embodied-agents/issues/30>`_
+* (fix) Runs callback disambiguation on layers topics using Sugarcoat reparse_inputs_callbacks, resolves `#31 <https://github.com/automatika-robotics/embodied-agents/issues/31>`_
+* Contributors: ahr, mkabtoul
+
+0.7.2 (2026-05-06)
+------------------
+* (chore) Updates complete agent recipes
+* (chore) Updates tool calling and go to x recipes to use memory
+* (feature) Enables passing component actions as tools to the llm component
+  - Executed through service calls
+* (refactor) Makes response handling from component action execution a utility
+* (chore) Updates go to x recipe to use the memory component
+* (fix) Fixes registering memory tools with llms before lifecycle configuration
+* (chore) Updates tool calling recipe to use the memory component
+* (chore) Updates semantic map recipes to use the memory component
+* Contributors: ahr
+
 0.7.1 (2026-05-02)
 ------------------
 * (chore) Bumps minimum sugarcoat version
