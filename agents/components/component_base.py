@@ -184,6 +184,14 @@ class Component(BaseComponent):
         """
         Verify component specific inputs or outputs using allowed topics if provided
         """
+
+        def _match_msg_type(topic, all_types) -> bool:
+            """Matches a topic against a set of allowed types"""
+            return any(issubclass(topic, allowed_t) for allowed_t in all_types) or any(
+                issubclass(allowed_t.get_ros_type(), topic.get_ros_type())
+                for allowed_t in all_types
+            )
+
         # type validation
         correct_type = all(isinstance(i, (BaseTopic, FixedInput)) for i in topics)
         if not correct_type:
@@ -206,9 +214,7 @@ class Component(BaseComponent):
             (
                 topic
                 for topic in all_msg_types
-                if not any(
-                    issubclass(topic, allowed_t) for allowed_t in all_topic_types
-                )
+                if not _match_msg_type(topic, all_topic_types)
             ),
             None,
         ):
