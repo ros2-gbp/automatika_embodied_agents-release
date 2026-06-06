@@ -1,8 +1,6 @@
 import json
 from abc import abstractmethod
 from copy import deepcopy
-import time
-from contextlib import contextmanager
 from typing import Optional, Sequence, Union, List, Dict, Type
 
 from ..ros import (
@@ -14,7 +12,6 @@ from ..ros import (
     BaseTopic,
     Event,
     Action,
-    LifecycleStateMsg,
 )
 from ..config import BaseComponentConfig
 from ..utils import flatten
@@ -187,6 +184,14 @@ class Component(BaseComponent):
         """
         Verify component specific inputs or outputs using allowed topics if provided
         """
+
+        def _match_msg_type(topic, all_types) -> bool:
+            """Matches a topic against a set of allowed types"""
+            return any(issubclass(topic, allowed_t) for allowed_t in all_types) or any(
+                issubclass(allowed_t.get_ros_type(), topic.get_ros_type())
+                for allowed_t in all_types
+            )
+
         # type validation
         correct_type = all(isinstance(i, (BaseTopic, FixedInput)) for i in topics)
         if not correct_type:
@@ -209,9 +214,7 @@ class Component(BaseComponent):
             (
                 topic
                 for topic in all_msg_types
-                if not any(
-                    issubclass(topic, allowed_t) for allowed_t in all_topic_types
-                )
+                if not _match_msg_type(topic, all_topic_types)
             ),
             None,
         ):
@@ -340,31 +343,3 @@ class Component(BaseComponent):
         self._update_inactive_input_topic(old_topic, new_topic)
 
         return None
-
-    # TODO: Move the context manager to sugarcoat base component
-    @contextmanager
-    def safe_restart(self):
-        """Stop the component, yield for operations, then restart and wait for ACTIVE state."""
-        self._maintain_default_services = True
-        self.stop()
-        self.trigger_cleanup()
-
-        try:
-            yield
-        finally:
-            self.start()
-
-            timeout_counter = 0
-            while self.lifecycle_state != LifecycleStateMsg.PRIMARY_STATE_ACTIVE and (
-                timeout_counter < self.config.wait_for_restart_time
-            ):
-                self.get_logger().warn(
-                    f"Component {self.node_name} is not in ACTIVE state. Waiting for it to become active again.",
-                    once=True,
-                )
-                time.sleep(1 / self.config.loop_rate)
-                timeout_counter += 1 / self.config.loop_rate
-
-            if self.lifecycle_state != LifecycleStateMsg.PRIMARY_STATE_ACTIVE:
-                self.health_status.set_fail_component()
-                raise RuntimeError("Error restarting the component")

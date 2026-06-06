@@ -71,7 +71,8 @@ class Launcher(BaseLauncher):
                 cortex_monitor = component
                 break
         if cortex_monitor:
-            # remove the Cortex component from the lists of components to monitor, as it will be the monitor itself
+            # remove the Cortex component from the lists of components to monitor,
+            # as it will be the monitor itself
             self._components.remove(cortex_monitor)
             components_names.remove(cortex_monitor.node_name)
             if cortex_monitor in services_components:
@@ -80,6 +81,8 @@ class Launcher(BaseLauncher):
                 action_components.remove(cortex_monitor)
             if cortex_monitor.node_name in all_components_to_activate_on_start:
                 all_components_to_activate_on_start.remove(cortex_monitor.node_name)
+
+            # set cortex as the monitor node now
             self.monitor_node = cortex_monitor
             self.monitor_node._init_internal_monitor(
                 components_names=components_names,
@@ -91,6 +94,13 @@ class Launcher(BaseLauncher):
                 activate_on_start=all_components_to_activate_on_start,
                 activation_timeout=self._components_activation_timeout,
             )
+            # Expose the robot plugin's actions to Cortex as execution tools
+            # and augment its planning prompt with the robot's identity.
+            # Must run after _init_internal_monitor and before _setup_additional_internal_actions
+            if self._robot_plugin is not None:
+                cortex_monitor.add_plugin_actions(self._robot_plugin)
+                cortex_monitor.set_robot_description(self._robot_plugin)
+
             # Add any additional internal actions related to the monitor (e.g. events handling actions)
             self._setup_additional_internal_actions(
                 self.monitor_node._additional_internal_actions

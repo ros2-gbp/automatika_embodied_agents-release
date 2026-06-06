@@ -26,6 +26,7 @@ from agents.ros import (
 # Python3.8 compatible NoneType
 NoneType = type(None)
 
+
 def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
     """Parse arguments."""
     parser = argparse.ArgumentParser(description="Component Executable Config")
@@ -75,6 +76,11 @@ def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
         help="DB Client",
     )
     parser.add_argument(
+        "--embedding_client",
+        type=str,
+        help="Embedding Client for Memory Component",
+    )
+    parser.add_argument(
         "--additional_model_clients",
         type=str,
         help="Additional model clients",
@@ -100,6 +106,11 @@ def _parse_args() -> Tuple[argparse.Namespace, List[str]]:
         "--additional_types",
         type=str,
         help="Additional type modules from derived packages",
+    )
+    parser.add_argument(
+        "--robot_plugin",
+        type=str,
+        help="Serialized robot plugin spec and feedback-bus endpoint",
     )
 
     return parser.parse_known_args()
@@ -265,6 +276,10 @@ def _setup_component_post_init(component: Any, args: argparse.Namespace) -> None
     if args.external_processors:
         component._external_processors_json = args.external_processors
 
+    # Rebuild the robot plugin and connect it to the HOST feedback bus
+    if args.robot_plugin:
+        component._robot_plugin_json = args.robot_plugin
+
     # Set additional model clients if any
     component.additional_model_clients = (
         _load_additional_model_clients(args.additional_model_clients)
@@ -379,6 +394,26 @@ def main():
             position=config._position,
             map_topic=config._map_topic,
             db_client=db_client,
+            config=config,
+            trigger=trigger,
+            component_name=component_name,
+            config_file=config_file,
+        )
+
+    elif component_type == all_components.Memory.__name__:
+        embedding_client_json = json.loads(args.embedding_client)
+        embedding_client = (
+            getattr(clients, embedding_client_json["client_type"])(
+                **embedding_client_json
+            )
+            if embedding_client_json
+            else None
+        )
+        component = comp_class(
+            layers=layers,
+            position=config._position,
+            model_client=model_client,
+            embedding_client=embedding_client,
             config=config,
             trigger=trigger,
             component_name=component_name,
