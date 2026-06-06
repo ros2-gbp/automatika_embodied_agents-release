@@ -1,3 +1,26 @@
+## automatika_embodied_agents (rolling) - 0.7.4-1
+
+The packages in the `automatika_embodied_agents` repository were released into the `rolling` distro by running `/usr/bin/bloom-release --rosdistro rolling automatika_embodied_agents` on `Sat, 06 Jun 2026 10:30:27 -0000`
+
+The `automatika_embodied_agents` package was released.
+
+Version of package(s) in repository `automatika_embodied_agents`:
+
+- upstream repository: https://github.com/automatika-robotics/ros-agents.git
+- release repository: https://github.com/ros2-gbp/automatika_embodied_agents-release.git
+- rosdistro version: `0.7.1-1`
+- old version: `0.7.1-1`
+- new version: `0.7.4-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## automatika_embodied_agents (lyrical) - 0.7.4-1
 
 The packages in the `automatika_embodied_agents` repository were released into the `lyrical` distro by running `/usr/bin/bloom-release --rosdistro lyrical automatika_embodied_agents` on `Sat, 06 Jun 2026 07:56:58 -0000`
