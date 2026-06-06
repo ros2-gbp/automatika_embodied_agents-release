@@ -2,6 +2,60 @@
 Changelog for package automatika_embodied_agents
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.4 (2026-06-05)
+------------------
+* (chore) Bumps up sugarcoat version
+* (refactor) Adds build url helper for building url schema if none provided
+* (fix) Allows say method to raise exceptions to be handled by parent 'execute_method' and fixes attribute check
+* (feature) Adds robot plugin serialization/deserialization to the executable
+* (fix) Adds using pre-init logger in methods executed before activation
+* (fix) Fixes an error where TLS endpoints couldnt be called by clients
+* (feature) Adds plugin actions to actions available to cortex and augments planning prompt with robot description from the plugin
+* Contributors: ahr, mkabtoul
+
+0.7.3 (2026-05-08)
+------------------
+* (fix) Fixes the helper method typo
+* (fix) Fixes validate topics check to include comparing the associated ROS2 message type, resolves `#30 <https://github.com/automatika-robotics/embodied-agents/issues/30>`_
+* (fix) Runs callback disambiguation on layers topics using Sugarcoat reparse_inputs_callbacks, resolves `#31 <https://github.com/automatika-robotics/embodied-agents/issues/31>`_
+* Contributors: ahr, mkabtoul
+
+0.7.2 (2026-05-06)
+------------------
+* (chore) Updates complete agent recipes
+* (chore) Updates tool calling and go to x recipes to use memory
+* (feature) Enables passing component actions as tools to the llm component
+  - Executed through service calls
+* (refactor) Makes response handling from component action execution a utility
+* (chore) Updates go to x recipe to use the memory component
+* (fix) Fixes registering memory tools with llms before lifecycle configuration
+* (chore) Updates tool calling recipe to use the memory component
+* (chore) Updates semantic map recipes to use the memory component
+* Contributors: ahr
+
+0.7.1 (2026-05-02)
+------------------
+* (chore) Bumps minimum sugarcoat version
+* (chore) Adds test for memory component
+* (chore) Adds an example recipe for using cortex with memory
+* (chore) Adds both component level and launcher level failure recovery in multiprocessing example
+* (chore) Updates docstrings. Adds deprecation for MapEncoding component in favour of memory component
+* (feature) Augments memory prompt for interoception tools
+* (feature) Adds mem layer alias for map layers with internal state flag for interoception topics
+* (feature) Adds memory specific planning prompt augmentation
+* (feature) Adds better failure handling in cortex for task summary
+* (feature) Adds serialization, deserialization of clients for memory component
+* (fix) Fixes init/deinit of ollama based embedding models
+* (feature) Adds classification in memory component actions for planning and execution actions
+* (feature) Updates cortex to utilize executed component action outputs and replan if the plan has not fully executed
+* (feature) Overrides component action decorator to differentiate between planning and execution actions in agents
+* (feautre) Changes component actions and fallbacks to raise errors and return meaningful responses on happy path
+* (feature) Adds a store specific memory method for cortex to write arbitrary runtime memories
+* (feautre) Adds information about perception layers in the memory components inspect method
+* (feature) Adds memory component using emem that exposes basic memory management tools as component actions
+* (chore) Removes safe_restart from base component as it has been upstreamed in sugarcoat
+* Contributors: ahr
+
 0.7.0 (2026-04-11)
 ------------------
 * (feature) Adds an optional output topic in cortex for capturing outputs when an action is not needed

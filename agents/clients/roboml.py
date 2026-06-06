@@ -63,7 +63,7 @@ class RoboMLHTTPClient(ModelClient):
             logging_level=logging_level,
             **kwargs,
         )
-        self.url = f"http://{self.host}:{self.port}"
+        self.url = self._build_url()
 
         # create httpx client
         self.client = httpx.Client(base_url=self.url, timeout=self.inference_timeout)
@@ -239,7 +239,7 @@ class RoboMLWSClient(RoboMLHTTPClient):
         self.request_queue: Optional[queue.Queue] = None
         self.response_queue: Optional[queue.Queue] = None
         self.websocket_endpoint = (
-            f"ws://{self.host}:{self.port}/{self.model_name}/ws_inference"
+            f"{self._build_url('ws')}/{self.model_name}/ws_inference"
         )
 
     def _inference(self) -> Optional[Dict]:
@@ -459,7 +459,7 @@ class RoboMLRESPClient(ModelClient):
         """Call inference on the model using data and inference parameters from the component"""
         try:
             if inference_input.get("stream"):
-                self.logger.warn(
+                self.logger.warning(
                     "RoboML RESPClient currently does not handle streaming. Set stream to False in component config to get rid of this warning."
                 )
                 inference_input.pop("stream")
