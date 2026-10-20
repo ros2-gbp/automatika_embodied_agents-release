@@ -1,18 +1,26 @@
+import base64
 import queue
 import socket
 import threading
-from io import BytesIO
-from typing import Any, Union, Optional, List, Dict
-import base64
 import time
+from collections.abc import Iterator
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Union
 
+from ..clients import RoboMLRESPClient, RoboMLWSClient
 from ..clients.model_base import ModelClient
-from ..clients import RoboMLWSClient, RoboMLRESPClient
 from ..config import TextToSpeechConfig
-from ..ros import Audio, String, Topic, StreamingString, component_action
-from ..utils import validate_func_args, load_model_repo
-from .model_component import ModelComponent
+from ..ros import (
+    ActionReturnType,
+    Audio,
+    StreamingString,
+    String,
+    Topic,
+    component_action,
+)
+from ..utils import load_model_repo, validate_func_args
 from .component_base import ComponentRunType
+from .model_component import ModelComponent
 
 
 class TextToSpeech(ModelComponent):
@@ -146,14 +154,11 @@ class TextToSpeech(ModelComponent):
             model_path=load_model_repo("local_tts", self.config.local_model_path),
             device=self.config.device_local_model,
             ncpu=self.config.ncpu_local_model,
+            speaker_id=self.config.speaker_id,
+            stream=self.config.stream,
+            model_options=self.config.local_model_options,
         )
-        # Local TTS does not support streaming
-        if self.config.stream:
-            self.get_logger().warning(
-                "Local TTS model does not support streaming. Setting stream to False."
-            )
-            self.config.stream = False
-            self.inference_params = self.config.get_inference_params()
+        self.inference_params = self.config.get_inference_params()
 
     def __get_audio_bytes(self, chunk: Union[bytes, str]) -> bytes:
         """Get audio bytes"""
@@ -281,8 +286,8 @@ class TextToSpeech(ModelComponent):
         :param fmt: Tuple of (sample_rate, channels) of the current stream
         :returns: Tuple of (stream, fmt) for reuse by the caller
         """
-        from soundfile import SoundFile
         import pyaudio
+        from soundfile import SoundFile
 
         with SoundFile(BytesIO(audio_bytes)) as f:
             new_fmt = (f.samplerate, f.channels)
@@ -370,7 +375,7 @@ class TextToSpeech(ModelComponent):
             },
         }
     )
-    def stop_playback(self, wait_for_thread: bool = True) -> bool:
+    def stop_playback(self, wait_for_thread: bool = True) -> ActionReturnType:
         """
         Stops the playback thread and clears any pending audio.
         Can be used to interrupt the audio playback through an event.
@@ -390,7 +395,7 @@ class TextToSpeech(ModelComponent):
             self._playback_thread.join()
             self.get_logger().debug("Thread terminated.")
 
-        return True
+        return True, "Playback stopped and pending audio cleared"
 
     @component_action(
         description={
@@ -411,7 +416,7 @@ class TextToSpeech(ModelComponent):
             },
         }
     )
-    def say(self, text: str) -> bool:
+    def say(self, text: str) -> ActionReturnType:
         """
             Say the input text.
 
@@ -431,7 +436,7 @@ class TextToSpeech(ModelComponent):
         ):
             self.stop_playback()
         self._execution_step(text=text)
-        return True
+        return True, "Text sent to speech"
 
     def _handle_websocket_streaming(self) -> Optional[List]:
         """Handle streaming output from a websocket client"""
@@ -489,11 +494,19 @@ class TextToSpeech(ModelComponent):
         # conduct inference
         result = self._call_inference(inference_input)
         if result:
-            if self.config.play_on_device:
-                self._play(result["output"])
+            output = result["output"]
+            # handle streaming local model generator of audio chunks
+            if isinstance(output, Iterator):
+                for chunk in output:
+                    if self.config.play_on_device:
+                        self._play(chunk)
+                    self._publish({"output": chunk})
+            else:
+                if self.config.play_on_device:
+                    self._play(output)
 
-            # publish result
-            self._publish(result)
+                # publish result
+                self._publish(result)
 
     def _warmup(self):
         """Warm up and stat check"""
@@ -503,17 +516,23 @@ class TextToSpeech(ModelComponent):
             **self.inference_params,
         }
 
+        def _drain(result):
+            # Consume streaming model generator
+            if result and isinstance(result.get("output"), Iterator):
+                for _ in result["output"]:
+                    pass
+
         # Run inference once to warm up and once to measure time
         if self.model_client:
             self.model_client.inference(inference_input)
         elif hasattr(self, "local_model"):
-            self.local_model(inference_input)
+            _drain(self.local_model(inference_input))
 
         start_time = time.time()
         if self.model_client:
             self.model_client.inference(inference_input)
         elif hasattr(self, "local_model"):
-            self.local_model(inference_input)
+            _drain(self.local_model(inference_input))
         elapsed_time = time.time() - start_time
 
         self.get_logger().warning(f"Approximate Inference time: {elapsed_time} seconds")
