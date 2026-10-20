@@ -3,7 +3,7 @@ The following model specification classes are meant to define a comman interface
 """
 
 from typing import Optional, Dict, Any, Literal, List
-from attrs import define, field, validators
+from attrs import Factory, define, field, validators
 from .ros import BaseAttrs, base_validators
 from .utils import build_lerobot_features_from_dataset_info, _LANGUAGE_CODES
 
@@ -12,6 +12,7 @@ __all__ = [
     "GenericMLLM",
     "GenericTTS",
     "GenericSTT",
+    "GenericDecisionModel",
     "TransformersLLM",
     "TransformersMLLM",
     "OllamaModel",
@@ -166,7 +167,7 @@ class GenericTTS(Model):
     :param name: An arbitrary name given to the model.
     :type name: str
     :param checkpoint: The model identifier (e.g., "tts-1", "tts-1-hd").
-                       For details: https://platform.openai.com/docs/models/tts
+                       For details: https://developers.openai.com/api/docs/models/tts-1
     :type checkpoint: str
     :param voice: The voice ID to use. OpenAI standard voices: 'alloy', 'echo', 'fable',
                   'onyx', 'nova', 'shimmer'. Other providers may have different IDs.
@@ -209,7 +210,7 @@ class GenericSTT(Model):
     :param name: An arbitrary name given to the model.
     :type name: str
     :param checkpoint: The model identifier (e.g., "whisper-1").
-                       For details: https://platform.openai.com/docs/models/whisper
+                       For details: https://developers.openai.com/api/docs/models/whisper-1
     :type checkpoint: str
     :param language: The language of the input audio (ISO-639-1 format, e.g., 'en', 'fr').
                      Improves accuracy if known. Default is None (auto-detect).
@@ -246,6 +247,36 @@ class GenericSTT(Model):
 
 
 @define(kw_only=True)
+class GenericDecisionModel(Model):
+    """
+    A generic decision model for TypeSafe-compatible /v1/systemone APIs.
+
+    A decision model answers typed questions about a state (choice, score or yes/no),
+    each in one forward pass without generating text, and gives a probability for
+    every answer.
+    Find details [here](https://github.com/ggml-org/llama.cpp/tree/master/tools/server#post-v1systemone-typesafe-compatible-system-one-api)
+
+    :param name: An arbitrary name given to the model.
+    :type name: str
+    :param checkpoint: The model identifier on the server, as listed by its /v1/models
+                       endpoint. llama-server lists the model file name, or the name
+                       given with --alias. In router mode, it uses it to pick the model.
+    :type checkpoint: str
+    :param init_timeout: The timeout in seconds for the initialization process. Defaults to None.
+    :type init_timeout: int, optional
+
+    Example usage:
+    ```python
+    # llama-server -m lev-Q8_0.gguf --alias lev
+    lev = GenericDecisionModel(name="lev", checkpoint="lev")
+    ```
+    """
+
+    def _get_init_params(self) -> Dict:
+        return {"checkpoint": self.checkpoint}
+
+
+@define(kw_only=True)
 class OllamaModel(LLM):
     """An Ollama model that needs to be initialized with an ollama tag as checkpoint.
 
@@ -255,6 +286,11 @@ class OllamaModel(LLM):
     :type checkpoint: str
     :param init_timeout: The timeout in seconds for the initialization process. Defaults to None.
     :type init_timeout: int, optional
+    :param think: Whether a thinking model thinks before it answers. None, the
+        default, leaves it to the model's own default. False makes a planner or
+        a tool-calling component answer much faster, and keeps a thinking model
+        from using its whole token budget before it answers.
+    :type think: bool, optional
     :param options: Optional dictionary to configure generation behavior. Options that conflict with component config options such as (num_predict and temperature) will be overridden if set in component config. Only the following keys with their specified value types are allowed. For details check [Ollama api documentation](https://github.com/ollama/ollama/blob/main/docs/api.md#generate-request-with-options):
         - num_keep: int
         - seed: int
@@ -277,7 +313,6 @@ class OllamaModel(LLM):
         - main_gpu: int
         - use_mmap: bool
         - num_thread: int
-        - think: bool
     :type options: dict, optional
 
      Example usage:
@@ -291,6 +326,7 @@ class OllamaModel(LLM):
 
     checkpoint: str = field(default="llama3.2:3b")
     port: Optional[int] = field(default=11434)
+    think: Optional[bool] = field(default=None)
     options: Optional[Dict[str, Any]] = field(default=None)
 
     @options.validator
@@ -320,7 +356,6 @@ class OllamaModel(LLM):
             "main_gpu": int,
             "use_mmap": bool,
             "num_thread": int,
-            "think": bool,
         }
 
         for key, val in value.items():
@@ -341,6 +376,7 @@ class OllamaModel(LLM):
         """Get init params for model initialization."""
         return {
             "checkpoint": self.checkpoint,
+            "think": self.think,
             "options": self.options,
         }
 
@@ -391,24 +427,30 @@ class TransformersMLLM(TransformersLLM):
 
 @define(kw_only=True)
 class RoboBrain2(Model):
-    """[RoboBrain 2.0 by BAAI](https://github.com/FlagOpen/RoboBrain2.0) supports interactive reasoning with long-horizon planning and closed-loop feedback, spatial perception for precise point and bbox prediction from complex instructions and temporal perception for future trajectory estimation.
-        @article{RoboBrain2.0TechnicalReport,
-        title={RoboBrain 2.0 Technical Report},
-        author={BAAI RoboBrain Team},
-        journal={arXiv preprint arXiv:2507.02029},
-        year={2025}
+    """[RoboBrain 2.0](https://github.com/FlagOpen/RoboBrain2.0) and [RoboBrain2.5](https://github.com/FlagOpen/RoboBrain2.5) models from BAAI; support interactive reasoning with long-horizon planning and closed-loop feedback, spatial perception for precise point and bbox prediction from complex instructions and temporal perception for future trajectory estimation.
+            @article{RoboBrain2.0TechnicalReport,
+            title={RoboBrain 2.0 Technical Report},
+            author={BAAI RoboBrain Team},
+            journal={arXiv preprint arXiv:2507.02029},
+            year={2025}
+        }
+            @article{tan2026robobrain25depthsight,
+      title={RoboBrain 2.5: Depth in Sight, Time in Mind},
+      author={Tan, Huajie and Zhou, Enshen and Li, Zhiyu and Xu, Yijie and Ji, Yuheng and Chen, Xiansheng and Chi, Cheng and Wang, Pengwei and Jia, Huizhu and Ao, Yulong and Cao, Mingyu and Chen, Sixiang and Li, Zhe and Liu, Mengzhen and Wang, Zixiao and Rong, Shanyu and Lyu, Yaoxu and Zhao, Zhongxia and Co, Peterson and Li, Yibo and Han, Yi and Xie, Shaoxuan and Yao, Guocai and Wang, Songjing and Zhang, Leiduo and Yang, Xi and Jiao, Yance and Shi, Donghai and Xie, Kunchang and Nie, Shaokai and Men, Chunlei and Lin, Yonghua and Wang, Zhongyuan and Huang, Tiejun and Zhang, Shanghang},
+      journal={arXiv preprint arXiv:2601.14352},
+      year={2026}
     }
-    :param name: An arbitrary name given to the model.
-    :type name: str
-    :param checkpoint: The name of the pre-trained model's checkpoint. Default is "BAAI/RoboBrain2.0-3B". For available checkpoints consult [RoboBrain2 Model Collection](https://huggingface.co/collections/BAAI/robobrain20-6841eeb1df55c207a4ea0036) on HuggingFace.
-    :type checkpoint: str
-    :param init_timeout: The timeout in seconds for the initialization process. Defaults to None.
-    :type init_timeout: int, optional
+        :param name: An arbitrary name given to the model.
+        :type name: str
+        :param checkpoint: The name of the pre-trained model's checkpoint. Default is "BAAI/RoboBrain2.0-3B". For available checkpoints consult [RoboBrain2 and RoboBrain2.5 Model Collections](https://huggingface.co/collections/BAAI) on HuggingFace or ModelScope.
+        :type checkpoint: str
+        :param init_timeout: The timeout in seconds for the initialization process. Defaults to None.
+        :type init_timeout: int, optional
 
-    Example usage:
-    ```python
-    robobrain = RoboBrain2(name='robobrain', checkpoint="BAAI/RoboBrain2.0-32B")
-    ```
+        Example usage:
+        ```python
+        robobrain = RoboBrain2(name='robobrain', checkpoint="BAAI/RoboBrain2.0-7B")
+        ```
     """
 
     checkpoint: str = field(default="BAAI/RoboBrain2.0-3B")
@@ -549,19 +591,22 @@ class LeRobotPolicy(Model):
     :type checkpoint: str
     :param policy_type:
     The type of LeRobot policy to load.
-    Supported values are:
+    Supported values (all policy types servable through the LeRobot Async Policy Server as of LeRobot 0.6.0) are:
+    - `"smolvla"` — General VLA from HuggingFace
     - `"diffusion"` — Diffusion-based action generation policy
     - `"act"` — Action Chunk Transformer policy
-    - `"smolvla"` — General VLA from HuggingFace
     - `"pi0"` — General VLA from Physical Intelligence
     - `"pi05"` — General VLA from Physical Intelligence
+    - `"groot"` — NVIDIA Isaac GR00T N1.7 cross-embodiment VLA (e.g. checkpoint `"nvidia/GR00T-N1.7-3B"`, requires LeRobot >= 0.6.0 on the server)
+    - `"tdmpc"` — Temporal Difference MPC policy
+    - `"vqbet"` — Vector-Quantized Behavior Transformer policy
     This field determines how the checkpoint is interpreted and which policy architecture is instantiated.
     Default: `"smolvla"`.
     :param dataset_info_file:
         URL or local path to the dataset metadata file (`info.json`).
         This file defines the input features and action structure that the policy must follow. Empty by default. If not provided, an attempt will be made by the VLA component to auto-generate it from the component config.
     :type dataset_info_file: str, optional
-    :param policy_type:
+    :param policy_device:
     The device on which the server should initialize the policy.
     Supported values are:
     - `"cuda"` — NVIDIA GPU available on server
@@ -571,6 +616,10 @@ class LeRobotPolicy(Model):
         The number of predicted actions produced per inference chunk. This is only applicable for certain policy types that implement Real Time Chunking (RTC) such as Pi0, and SmolVLA
         Default: `50`.
     :type actions_per_chunk: int
+    :param rename_map:
+        Advanced option, you normally do NOT need this — leave empty. Only needed when the checkpoint was trained with feature names different from those in your dataset metadata (e.g. a fine-tune of a generalist policy that expects `"observation.images.top"` while your dataset calls the same camera `"observation.images.front"`). This is unrelated to `joint_names_map`/`camera_inputs_map` in VLAConfig, which map your robot's joint names and topics to the dataset feature names and are always required.
+        Default: `{}`.
+    :type rename_map: Dict[str, str]
     :param init_timeout:
         Optional timeout (in seconds) for initialization.
         Default: `None`.
@@ -594,13 +643,30 @@ class LeRobotPolicy(Model):
     """
 
     checkpoint: str = field(default="lerobot/smolvla_base")
-    policy_type: Literal["smolvla", "diffusion", "act", "pi0", "pi05"] = field(
-        default="smolvla"
+    policy_type: Literal[
+        "smolvla", "diffusion", "act", "pi0", "pi05", "groot", "tdmpc", "vqbet"
+    ] = field(
+        default="smolvla",
+        validator=base_validators.in_([
+            "smolvla",
+            "diffusion",
+            "act",
+            "pi0",
+            "pi05",
+            "groot",
+            "tdmpc",
+            "vqbet",
+        ]),
     )
     actions_per_chunk: int = field(default=50)
-    policy_device: Literal["cpu", "cuda"] = field(default="cuda")
+    policy_device: Literal["cpu", "cuda"] = field(
+        default="cuda", validator=base_validators.in_(["cpu", "cuda"])
+    )
     dataset_info_file: Optional[str] = field(default=None)
-    _features: Dict = field(default={})  # Created in the component if missing
+    rename_map: Dict[str, str] = field(default=Factory(dict))
+    _features: Dict = field(
+        default=Factory(dict)
+    )  # Created in the component if missing
     _actions: Optional[Dict] = field(default=None)
     _image_keys: Optional[List] = field(default=None)
     _joint_keys: Optional[List] = field(default=None)
@@ -622,4 +688,5 @@ class LeRobotPolicy(Model):
             "features": self._features,
             "actions_per_chunk": self.actions_per_chunk,
             "device": self.policy_device,
+            "rename_map": self.rename_map,
         }
