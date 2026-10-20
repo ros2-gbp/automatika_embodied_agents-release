@@ -2,6 +2,8 @@
 
 import sys
 import json
+import threading
+import time
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -22,7 +24,13 @@ def local_llm(mock_llama_cpp):
     llm.llm = MagicMock()
     llm.device = "cpu"
     llm.ncpu = 1
+    llm._lock = threading.Lock()
     return llm
+
+
+def test_the_context_length_is_the_loaded_one(local_llm):
+    local_llm.llm.n_ctx.return_value = 8192
+    assert local_llm.context_length == 8192
 
 
 def _mock_response(content="Hello there!", tool_calls=None):
@@ -48,10 +56,14 @@ def _mock_stream_chunks(tokens):
     """Build mock streaming chunks from a list of token strings."""
     chunks = []
     # First chunk: role announcement
-    chunks.append({"choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]})
+    chunks.append({
+        "choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]
+    })
     # Content chunks
     for token in tokens:
-        chunks.append({"choices": [{"delta": {"content": token}, "finish_reason": None}]})
+        chunks.append({
+            "choices": [{"delta": {"content": token}, "finish_reason": None}]
+        })
     # Final chunk
     chunks.append({"choices": [{"delta": {}, "finish_reason": "stop"}]})
     return chunks
@@ -86,9 +98,7 @@ class TestCallStreaming:
         chunks = _mock_stream_chunks(["Hello", " world"])
         local_llm.llm.create_chat_completion.return_value = iter(chunks)
 
-        result = local_llm(
-            {"query": [{"role": "user", "content": "Hi"}]}, stream=True
-        )
+        result = local_llm({"query": [{"role": "user", "content": "Hi"}]}, stream=True)
         assert "output" in result
         tokens = list(result["output"])
         assert tokens == ["Hello", " world"]
@@ -111,21 +121,180 @@ class TestCallWithTools:
         )
 
         tools = [{"type": "function", "function": {"name": "route_to_nav"}}]
-        result = local_llm(
-            {"query": [{"role": "user", "content": "Go"}], "tools": tools}
-        )
+        result = local_llm({
+            "query": [{"role": "user", "content": "Go"}],
+            "tools": tools,
+        })
         assert "tool_calls" in result
         assert result["tool_calls"][0]["function"]["name"] == "route_to_nav"
         assert result["tool_calls"][0]["function"]["arguments"] == {"x": 1}
+
+    def test_a_tool_call_with_invalid_arguments_is_dropped(self, local_llm):
+        tool_calls = [
+            {"function": {"name": "route_to_nav", "arguments": '{"x": '}},
+            {"function": {"name": "route_to_vision", "arguments": json.dumps({})}},
+        ]
+        local_llm.llm.create_chat_completion.return_value = _mock_response(
+            content=None, tool_calls=tool_calls
+        )
+
+        tools = [{"type": "function", "function": {"name": "route_to_nav"}}]
+        result = local_llm({
+            "query": [{"role": "user", "content": "Go"}],
+            "tools": tools,
+        })
+
+        assert [call["function"]["name"] for call in result["tool_calls"]] == [
+            "route_to_vision"
+        ]
+
+    def test_inline_tool_calls_extracted_from_text(self, local_llm):
+        """llama-cpp's GGUF-template handler leaves Qwen/Hermes tool calls as
+        text — LocalLLM must parse them into the structured field."""
+        content = (
+            "<think>\nThe user asks a visual question.\n</think>\n\n"
+            '<tool_call>\n{"name": "route_to_vision", "arguments": {}}\n</tool_call>'
+        )
+        local_llm.llm.create_chat_completion.return_value = _mock_response(content)
+
+        tools = [{"type": "function", "function": {"name": "route_to_vision"}}]
+        result = local_llm({
+            "query": [{"role": "user", "content": "what do you see"}],
+            "tools": tools,
+        })
+        assert "<tool_call>" not in result["output"]
+        assert result["tool_calls"][0]["function"]["name"] == "route_to_vision"
+        assert result["tool_calls"][0]["function"]["arguments"] == {}
+
+    def test_inline_tool_calls_ignored_without_tools(self, local_llm):
+        content = '<tool_call>\n{"name": "fn", "arguments": {}}\n</tool_call>'
+        local_llm.llm.create_chat_completion.return_value = _mock_response(content)
+
+        result = local_llm({"query": [{"role": "user", "content": "Hi"}]})
+        assert "tool_calls" not in result
+        assert "<tool_call>" in result["output"]
+
+    def test_malformed_inline_tool_call_kept_as_text(self, local_llm):
+        content = "<tool_call>\n{not valid json}\n</tool_call>"
+        local_llm.llm.create_chat_completion.return_value = _mock_response(content)
+
+        tools = [{"type": "function", "function": {"name": "fn"}}]
+        result = local_llm({
+            "query": [{"role": "user", "content": "Hi"}],
+            "tools": tools,
+        })
+        assert "tool_calls" not in result
 
     def test_passes_tools_to_api(self, local_llm):
         local_llm.llm.create_chat_completion.return_value = _mock_response("ok")
 
         tools = [{"type": "function", "function": {"name": "test_fn"}}]
-        local_llm(
-            {"query": [{"role": "user", "content": "Hi"}], "tools": tools}
-        )
+        local_llm({"query": [{"role": "user", "content": "Hi"}], "tools": tools})
 
         call_kwargs = local_llm.llm.create_chat_completion.call_args[1]
         assert call_kwargs["tools"] == tools
         assert call_kwargs["tool_choice"] == "auto"
+
+
+class TestThreadSafety:
+    def test_concurrent_calls_serialized(self, local_llm):
+        """llama-cpp contexts are not thread-safe — concurrent component
+        callbacks must never overlap inside create_chat_completion."""
+        active, max_active = 0, 0
+
+        def fake_create(**kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            time.sleep(0.01)
+            active -= 1
+            return _mock_response("ok")
+
+        local_llm.llm.create_chat_completion.side_effect = fake_create
+
+        threads = [
+            threading.Thread(
+                target=local_llm, args=({"query": [{"role": "user", "content": "x"}]},)
+            )
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert max_active == 1
+
+
+class TestLocalLLMModelOptions:
+    @staticmethod
+    def _fake_llama(mock_llama_cpp):
+        """Install a fake Llama class with a realistic signature, recording
+        constructor and from_pretrained calls."""
+        calls = {}
+
+        class FakeLlama:
+            def __init__(
+                self,
+                model_path=None,
+                n_ctx=512,
+                n_gpu_layers=0,
+                n_threads=1,
+                n_batch=512,
+                flash_attn=False,
+                chat_format=None,
+                verbose=True,
+            ):
+                calls["init"] = {
+                    "model_path": model_path,
+                    "n_ctx": n_ctx,
+                    "n_gpu_layers": n_gpu_layers,
+                    "n_threads": n_threads,
+                    "n_batch": n_batch,
+                    "flash_attn": flash_attn,
+                    "chat_format": chat_format,
+                    "verbose": verbose,
+                }
+
+            @classmethod
+            def from_pretrained(cls, repo_id=None, filename=None, **kwargs):
+                calls["from_pretrained"] = {
+                    "repo_id": repo_id,
+                    "filename": filename,
+                    **kwargs,
+                }
+                return MagicMock()
+
+        mock_llama_cpp.Llama = FakeLlama
+        return calls
+
+    def test_options_passed_and_defaults_set(self, mock_llama_cpp, tmp_path):
+        calls = self._fake_llama(mock_llama_cpp)
+        from agents.utils.local_llm import LocalLLM
+
+        gguf = tmp_path / "model.gguf"
+        gguf.touch()
+        LocalLLM(str(gguf), device="cpu", ncpu=2, model_options={"n_batch": 1024})
+        assert calls["init"]["n_batch"] == 1024
+        # context defaults to the model's trained length, not llama-cpp's 512
+        assert calls["init"]["n_ctx"] == 0
+        assert calls["init"]["n_threads"] == 2
+
+    def test_filename_selects_quant_from_repo(self, mock_llama_cpp):
+        calls = self._fake_llama(mock_llama_cpp)
+        from agents.utils.local_llm import LocalLLM
+
+        LocalLLM(
+            "some/repo-GGUF",
+            device="cpu",
+            model_options={"filename": "*q4_k_m*.gguf"},
+        )
+        assert calls["from_pretrained"]["filename"] == "*q4_k_m*.gguf"
+
+    def test_unknown_option_raises(self, mock_llama_cpp, tmp_path):
+        self._fake_llama(mock_llama_cpp)
+        from agents.utils.local_llm import LocalLLM
+
+        gguf = tmp_path / "model.gguf"
+        gguf.touch()
+        with pytest.raises(ValueError, match="Valid options"):
+            LocalLLM(str(gguf), model_options={"not_an_option": 1})
