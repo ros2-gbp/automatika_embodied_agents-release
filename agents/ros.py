@@ -8,15 +8,24 @@ from importlib.util import find_spec
 from rclpy.logging import get_logger
 
 from sensor_msgs.msg import JointState as JointStateROS
+from geometry_msgs.msg import Pose as ROSPose
+from geometry_msgs.msg import PoseStamped as ROSPoseStamped
+from shape_msgs.msg import SolidPrimitive
 
 # FROM SUGARCOAT
 from ros_sugar.supported_types import (
     SupportedType,
     Audio,
+    Bool,
+    CameraInfo,
     Image,
     CompressedImage,
     OccupancyGrid,
     Odometry,
+    PointCloud2,
+    Pose,
+    PoseArray,
+    PoseStamped,
     String,
     ROSImage,
     ROSCompressedImage,
@@ -29,44 +38,75 @@ from ros_sugar.io.topic import QoSConfig, Topic as BaseTopic
 from ros_sugar.config import (
     BaseComponentConfig,
     ComponentRunType,
+    ExternalProcessorType,
     BaseAttrs,
     base_validators,
 )
-from ros_sugar.core import BaseComponent, Monitor
+from ros_sugar.core import (
+    COMPONENT_ACTION_SERVER,
+    COMPONENT_METHOD,
+    COMPONENT_SERVICE,
+    MONITOR_METHOD,
+    MONITOR_OWNER,
+    PLUGIN_ACTION,
+    BaseComponent,
+    Monitor,
+    RegisteredAction,
+    RegisteredEvent,
+    Routine,
+    RoutineStatus,
+    SystemActionRegistry,
+)
 from ros_sugar.core.component import MutuallyExclusiveCallbackGroup
 from ros_sugar import UI_EXTENSIONS
 from ros_sugar.utils import (
+    ActionReturnType,
     component_action as _sugar_component_action,
     component_fallback,
     get_methods_with_decorator,
 )
 from ros_sugar.io.utils import run_external_processor
+from ros_sugar.launch.executable import run_component
 from ros_sugar.core import Event, Action
 from ros_sugar import actions
-from ros_sugar.base_clients import ServiceClientHandler, ActionClientHandler
+from ros_sugar.base_clients import (
+    ActionClientConfig,
+    ActionClientHandler,
+    ServiceClientConfig,
+    ServiceClientHandler,
+)
+from ros_sugar.io.datatypes import PointCloudData, read_camera_info
 
 from .launcher import Launcher
 
 # SUGATCOAT INTERFACES
 from automatika_ros_sugar.srv import ExecuteMethod
+from rcl_interfaces.srv import GetParameters
+from std_srvs.srv import Empty
 
 # AGENTS TYPES
 from automatika_embodied_agents.msg import (
     Point2D,
     Bbox2D,
+    Bbox3D as ROSBbox3D,
     Detections2D,
     Detections2DMultiSource,
+    Detections3D as ROSDetections3D,
 )
 from automatika_embodied_agents.msg import (
+    Decision as ROSDecision,
     StreamingString as ROSStreamingString,
     Video as ROSVideo,
     Trackings as ROSTrackings,
     TrackingsMultiSource as ROSTrackingsMultiSource,
     PointsOfInterest as ROSPointsOfInterest,
 )
-from automatika_embodied_agents.action import VisionLanguageAction
+from automatika_embodied_agents.action import MoveManipulator, VisionLanguageAction
 from .callbacks import (
+    DecisionCallback,
     DetectionsCallback,
+    TrackingsCallback,
+    Detections3DCallback,
     DetectionsMultiSourceCallback,
     PointsOfInterestCallback,
     RGBDCallback,
@@ -80,13 +120,22 @@ from .utils.actions import JointsData
 __all__ = [
     "String",
     "StreamingString",
+    "Decision",
     "Video",
     "Audio",
+    "Bool",
+    "CameraInfo",
     "Image",
     "CompressedImage",
     "OccupancyGrid",
     "Odometry",
+    "PointCloud2",
+    "PointCloudData",
+    "Pose",
+    "PoseArray",
+    "PoseStamped",
     "Detections",
+    "Detections3D",
     "DetectionsMultiSource",
     "PointsOfInterest",
     "Trackings",
@@ -104,10 +153,12 @@ __all__ = [
     "BaseComponent",
     "BaseComponentConfig",
     "ComponentRunType",
+    "ExternalProcessorType",
     "Launcher",
     "Monitor",
     "MemLayer",
     "MapLayer",
+    "PriorMemory",
     "Route",
     "MutuallyExclusiveCallbackGroup",
     "Event",
@@ -115,9 +166,31 @@ __all__ = [
     "Action",
     "component_fallback",
     "component_action",
+    "ActionReturnType",
+    "SystemActionRegistry",
+    "Routine",
+    "RoutineStatus",
+    "RegisteredAction",
+    "RegisteredEvent",
+    "COMPONENT_METHOD",
+    "COMPONENT_ACTION_SERVER",
+    "COMPONENT_SERVICE",
+    "MONITOR_METHOD",
+    "MONITOR_OWNER",
+    "PLUGIN_ACTION",
     "VisionLanguageAction",
+    "MoveManipulator",
+    "GetParameters",
     "run_external_processor",
+    "run_component",
+    "read_camera_info",
+    "Empty",
+    "ROSPose",
+    "ROSPoseStamped",
+    "SolidPrimitive",
+    "ServiceClientConfig",
     "ServiceClientHandler",
+    "ActionClientConfig",
     "ActionClientHandler",
     "get_ros_msg_fields_dict",
     "ros_msg_to_str",
@@ -164,14 +237,19 @@ def component_action(
     """Wrapper around sugarcoat's ``component_action`` decorator.
 
     Delegates to ``ros_sugar.utils.component_action`` for the core
-    behavior and additionally tags the method with ``_action_phase``
-    — a hint to Cortex about whether the tool is a planning tool,
-    an execution tool, or both.
+    behavior and additionally writes the ``phase`` into the tool
+    description — a hint to Cortex about whether the tool is a planning
+    tool, an execution tool, or both. It travels inside the description
+    so that it reaches Cortex with the tool schema, through the action
+    registry, whatever process the component runs in.
 
-    Can be used the same way as sugarcoat's decorator:
+    Can be used the same way as sugarcoat's decorator. An action must be
+    annotated to return ``ActionReturnType`` and return ``(success, message)``,
+    where the message carries the result or the error:
 
         @component_action(description={...}, phase=ActionPhase.BOTH)
-        def c(self) -> str: ...
+        def c(self) -> ActionReturnType:
+            return True, "done"
 
     If ``phase`` is not specified the action defaults to
     ``ActionPhase.EXECUTION``, preserving the previous behavior.
@@ -188,11 +266,12 @@ def component_action(
     phase_value = phase.value if isinstance(phase, ActionPhase) else str(phase)
 
     def _wrap(func: Callable) -> Callable:
-        wrapped = _sugar_component_action(
-            function=func, description=description, active=active
+        described = (
+            {**description, "phase": phase_value} if description is not None else None
         )
-        wrapped._action_phase = phase_value
-        return wrapped
+        return _sugar_component_action(
+            function=func, description=described, active=active
+        )
 
     if function is not None:
         return _wrap(function)
@@ -223,6 +302,7 @@ class StreamingString(SupportedType):
         output: str,
         stream: bool = False,
         done: bool = True,
+        stamp: Optional[Any] = None,
         **_,
     ) -> ROSStreamingString:
         """
@@ -230,9 +310,60 @@ class StreamingString(SupportedType):
         :return: ROSStreamingString
         """
         msg = ROSStreamingString()
+        # The time of the source that prompted the text reply, else None
+        if stamp is not None:
+            msg.header.stamp = stamp
         msg.stream = stream
         msg.done = done
         msg.data = output
+        return msg
+
+
+class Decision(SupportedType):
+    """
+    Wraps the `automatika_embodied_agents.msg.Decision` message type.
+
+    This type represents the answer of a decision model to one typed question
+    about a state: a choice, a score or a yes/no (noul) answer, with the
+    probability of every option.
+
+    **ROS2 Message Type**: `automatika_embodied_agents/msg/Decision`
+    """
+
+    callback = DecisionCallback
+    _ros_type = ROSDecision
+
+    @classmethod
+    def convert(cls, output: Dict, id: str = "", **_) -> ROSDecision:
+        """
+        Takes one answer of the /v1/systemone API and the id of its question
+        and converts it into a ROS message of type Decision
+
+        :param output: The answer, as the API returns it
+        :param id: The id of the question answered
+        :return: Decision
+        """
+        msg = ROSDecision()
+        msg.id = id
+        msg.type = output.get("type", "")
+        if msg.type == "noul":
+            # A noul answer is one probability
+            msg.noul = float(output["noul"])
+            msg.confidence = abs(2.0 * msg.noul - 1.0)
+            msg.options = ["false", "true"]
+            msg.probabilities = [1.0 - msg.noul, msg.noul]
+            return msg
+        probabilities = output.get("probabilities") or {}
+        msg.confidence = float(output.get("confidence", 0.0))
+        if msg.type == "choice":
+            msg.choice = output.get("choice", "")
+            msg.options = list(probabilities)
+        else:
+            # the levels of a score are described in its legend by index
+            msg.score = float(output.get("score", 0.0))
+            legend = output.get("legend") or {}
+            msg.options = [str(legend.get(key, key)) for key in probabilities]
+        msg.probabilities = [float(p) for p in probabilities.values()]
         return msg
 
 
@@ -247,6 +378,7 @@ class Video(SupportedType):
 
     _ros_type = ROSVideo
     callback = VideoCallback
+    _ui_rate_sampled = True  # lists of continuous frames
 
     @classmethod
     def convert(
@@ -271,6 +403,42 @@ class Video(SupportedType):
         return msg
 
 
+def _to_bbox_2d(bbox: Any) -> Bbox2D:
+    """Build a Bbox2D message from an (x1, y1, x2, y2) box in pixels"""
+    box = Bbox2D()
+    box.top_left_x = float(bbox[0])
+    box.top_left_y = float(bbox[1])
+    box.bottom_right_x = float(bbox[2])
+    box.bottom_right_y = float(bbox[3])
+    return box
+
+
+def _attach_source_image(msg: Any, image: Any) -> None:
+    """Attach a source image (and its depth, if any) to a perception message.
+    Also copies the image's header onto the message, so the detections carry
+    the frame they were made in.
+
+    :param msg: Perception message with image/compressed_image/depth fields
+    :param image: Source ROS image message (Image, CompressedImage or RGBD)
+    """
+    if image is None:
+        return
+    if isinstance(image, ROSCompressedImage):
+        msg.compressed_image = CompressedImage.convert(image)
+        source = image
+    # Handle RealSense RGBD msgs
+    elif hasattr(image, "depth"):
+        msg.image = Image.convert(image.rgb)
+        msg.depth = Image.convert(image.depth)
+        source = image.rgb
+    else:
+        msg.image = Image.convert(image)
+        source = image
+
+    if hasattr(source, "header") and hasattr(msg, "header"):
+        msg.header = source.header
+
+
 class Detections(SupportedType):
     """
     Wraps the `automatika_embodied_agents.msg.Detections2D` message type.
@@ -283,51 +451,38 @@ class Detections(SupportedType):
 
     _ros_type = Detections2D
     callback = DetectionsCallback
+    _ui_rate_sampled = True  # camera-rate frames + bbox drawing/JPEG encode
 
     @classmethod
     def convert(
         cls,
-        output: Union[Dict, List[Dict]],
-        images: Union[
-            ROSImage,
-            ROSCompressedImage,
-            np.ndarray,
-            List[ROSImage],
-            List[ROSCompressedImage],
-            List[np.ndarray],
-        ],
+        output: Dict,
+        images: Union[ROSImage, ROSCompressedImage, np.ndarray, None] = None,
         **_,
     ) -> Detections2D:
         """
-        Takes object detection data and converts it into a ROS message
-        of type Detection2D
+        Takes one camera's object detection data and converts it into a ROS
+        message of type Detection2D
+
+        :param output: Detections found in a single image
+        :param images: The image they were found in
         :return: Detection2D
         """
         if isinstance(output, List):
-            output = output[0]
-            images = images[0] if images else []
+            raise TypeError(
+                "Detections2D describes a single camera and cannot carry "
+                "detections from several. Use a Detections2DMultiSource output "
+                "topic for a component that detects on more than one image."
+            )
         msg = Detections2D()
         msg.scores = output.get("scores") or []
         msg.labels = output.get("labels") or []
         boxes = []
         for bbox in output.get("bboxes") or []:
-            box = Bbox2D()
-            box.top_left_x = float(bbox[0])
-            box.top_left_y = float(bbox[1])
-            box.bottom_right_x = float(bbox[2])
-            box.bottom_right_y = float(bbox[3])
-            boxes.append(box)
+            boxes.append(_to_bbox_2d(bbox))
 
         msg.boxes = boxes
-        if images:
-            if isinstance(images, ROSCompressedImage):
-                msg.compressed_image = CompressedImage.convert(images)
-            # Handle RealSense RGBD msgs
-            elif hasattr(images, "depth"):
-                msg.image = Image.convert(images.rgb)
-                msg.depth = Image.convert(images.depth)
-            else:
-                msg.image = Image.convert(images)
+        _attach_source_image(msg, images)
         return msg
 
 
@@ -343,6 +498,7 @@ class DetectionsMultiSource(SupportedType):
 
     _ros_type = Detections2DMultiSource
     callback = DetectionsMultiSourceCallback
+    _ui_rate_sampled = True  # camera-rate frames + bbox drawing/JPEG encode
 
     @classmethod
     def convert(cls, output: List, images: List, **_) -> Detections2DMultiSource:
@@ -359,6 +515,68 @@ class DetectionsMultiSource(SupportedType):
         return msg
 
 
+class Detections3D(SupportedType):
+    """
+    Wraps the `automatika_embodied_agents.msg.Detections3D` message type.
+
+    This type represents detected objects in metric space, each with a
+    labelled 3D bounding box in a named frame rather than in image space.
+
+    **ROS2 Message Type**: `automatika_embodied_agents/msg/Detections3D`
+    """
+
+    _ros_type = ROSDetections3D
+    callback = Detections3DCallback
+
+    @classmethod
+    def convert(
+        cls,
+        output: List,
+        labels: Optional[List[str]] = None,
+        scores: Optional[List[float]] = None,
+        depth_validity: Optional[List[float]] = None,
+        boxes_2d: Optional[List] = None,
+        source_frame: str = "",
+        stamp: Optional[Any] = None,
+        **_,
+    ) -> ROSDetections3D:
+        """
+        Takes 3D object detections and converts them into a ROS message
+        of type Detections3D
+
+        :param output: Boxes as (center, size) pairs, each in meters
+        :return: Detections3D
+        """
+        msg = ROSDetections3D()
+        # The frame's time, when the caller has it
+        if stamp is not None:
+            msg.header.stamp = stamp
+        boxes = []
+        for center, size in output:
+            box = ROSBbox3D()
+            box.center.position.x = float(center[0])
+            box.center.position.y = float(center[1])
+            box.center.position.z = float(center[2])
+            # Boxes are axis aligned in the frame they are given in
+            box.center.orientation.w = 1.0
+            box.size.x = float(size[0])
+            box.size.y = float(size[1])
+            box.size.z = float(size[2])
+            boxes.append(box)
+
+        msg.boxes = boxes
+        msg.labels = labels or []
+        msg.scores = [float(score) for score in scores or []]
+        msg.depth_validity = [float(value) for value in depth_validity or []]
+        # The 2D boxes come through as plain pixel tuples from the detector
+        msg.boxes_2d = [
+            box if isinstance(box, Bbox2D) else _to_bbox_2d(box)
+            for box in boxes_2d or []
+        ]
+        msg.source_frame = source_frame
+        return msg
+
+
 class PointsOfInterest(SupportedType):
     """
     Wraps the `automatika_embodied_agents.msg.PointsOfInterest` message type.
@@ -371,6 +589,7 @@ class PointsOfInterest(SupportedType):
 
     _ros_type = ROSPointsOfInterest
     callback = PointsOfInterestCallback  # not defined
+    _ui_rate_sampled = True  # camera-rate frames + point drawing/JPEG encode
 
     @classmethod
     def convert(
@@ -393,14 +612,7 @@ class PointsOfInterest(SupportedType):
             points.append(point)
         msg.points = points
 
-        if isinstance(image, ROSCompressedImage):
-            msg.compressed_image = CompressedImage.convert(image)
-        # Handle RealSense RGBD msgs
-        elif hasattr(image, "depth"):
-            msg.image = Image.convert(image.rgb)
-            msg.depth = Image.convert(image.depth)
-        else:
-            msg.image = Image.convert(image)
+        _attach_source_image(msg, image)
         return msg
 
 
@@ -415,31 +627,30 @@ class Trackings(SupportedType):
     """
 
     _ros_type = ROSTrackings
-    callback = None  # Not defined in EmbodiedAgents
+    callback = TrackingsCallback
+    _ui_rate_sampled = True  # camera-rate frames + bbox drawing/JPEG encode
 
     @classmethod
     def convert(
         cls,
-        output: Union[Dict, List[Dict]],
-        images: Union[
-            ROSImage,
-            ROSCompressedImage,
-            np.ndarray,
-            List[ROSImage],
-            List[ROSCompressedImage],
-            List[np.ndarray],
-        ],
+        output: Dict,
+        images: Union[ROSImage, ROSCompressedImage, np.ndarray, None] = None,
         **_,
     ) -> ROSTrackings:
         """
-        Takes tracking data and converts it into a ROS message
+        Takes one camera's tracking data and converts it into a ROS message
         of type Tracking
+
+        :param output: Tracks found in a single image
+        :param images: The image they were found in
         :return: ROSTracking
         """
-        # Only consider the first datapoint if a list is sent
         if isinstance(output, List):
-            output = output[0]
-            images = images[0]
+            raise TypeError(
+                "Trackings describes a single camera and cannot carry tracks "
+                "from several. Use a TrackingsMultiSource output topic for a "
+                "component that tracks in more than one image."
+            )
         msg = ROSTrackings()
         msg.ids = output.get("ids") or []
         msg.labels = output.get("tracked_labels") or []
@@ -465,24 +676,12 @@ class Trackings(SupportedType):
         # tracked_bboxes: list of [x1, y1, x2, y2] bounding boxes
         if o_tracked_bboxes := output.get("tracked_bboxes"):
             for bbox in o_tracked_bboxes:
-                box = Bbox2D()
-                box.top_left_x = float(bbox[0])
-                box.top_left_y = float(bbox[1])
-                box.bottom_right_x = float(bbox[2])
-                box.bottom_right_y = float(bbox[3])
-                tracked_boxes.append(box)
+                tracked_boxes.append(_to_bbox_2d(bbox))
 
         msg.boxes = tracked_boxes
         msg.centroids = centroids
         msg.estimated_velocities = estimated_velocities
-        if isinstance(images, ROSCompressedImage):
-            msg.compressed_image = CompressedImage.convert(images)
-        # Handle RealSense RGBD msgs
-        elif hasattr(images, "depth"):
-            msg.image = Image.convert(images.rgb)
-            msg.depth = Image.convert(images.depth)
-        else:
-            msg.image = Image.convert(images)
+        _attach_source_image(msg, images)
         return msg
 
 
@@ -525,6 +724,7 @@ class RGBD(SupportedType):
     """
 
     callback = RGBDCallback
+    _ui_rate_sampled = True  # camera-rate RGB-D frames
 
     @classmethod
     def get_ros_type(cls) -> type:
@@ -558,6 +758,14 @@ class JointTrajectoryPoint(SupportedType):
         return JointTrajectoryPointROS
 
     @classmethod
+    def _to_ros_duration(cls, seconds: float) -> Any:
+        """Convert seconds as float to a builtin_interfaces Duration message"""
+        from builtin_interfaces.msg import Duration
+
+        sec = int(seconds)
+        return Duration(sec=sec, nanosec=int((seconds - sec) * 1e9))
+
+    @classmethod
     def convert(cls, output: JointsData, index: Optional[int] = None, **_) -> Any:
         """
         Takes joint state data and converts it into a ROS message
@@ -566,12 +774,17 @@ class JointTrajectoryPoint(SupportedType):
         :return: JointTrajectory
         """
         msg = cls.get_ros_type()()
-        msg.time_from_start = output.delay
+        # Point idx is reached after the initial delay plus the per point
+        # duration of all points up to and including this one
+        point_number = 1 if index is None else index + 1
+        msg.time_from_start = cls._to_ros_duration(
+            output.delay + output.duration * point_number
+        )
 
         if index is None:
             msg.positions = output.positions.tolist()
             msg.velocities = output.velocities.tolist()
-            msg.accelerations = output.velocities.tolist()
+            msg.accelerations = output.accelerations.tolist()
             msg.effort = output.efforts.tolist()
             return msg
 
@@ -674,7 +887,7 @@ class JointJog(SupportedType):
 
         msg.displacements = output.positions.tolist()
         msg.velocities = output.velocities.tolist()
-        msg.duration = output.duration.tolist()
+        msg.duration = float(output.duration)
 
         return msg
 
@@ -712,8 +925,10 @@ class JointState(SupportedType):
 
 agent_types = [
     StreamingString,
+    Decision,
     Video,
     Detections,
+    Detections3D,
     DetectionsMultiSource,
     Trackings,
     TrackingsMultiSource,
@@ -753,7 +968,7 @@ class Topic(BaseTopic):
 
     :param name: Name of the topic
     :type name: str
-    :param msg_type: One of the SupportedTypes. This parameter can be set by passing the SupportedType data-type name as a string. See a list of supported types [here](https://automatika-robotics.github.io/sugarcoat/advanced/types.html)
+    :param msg_type: One of the SupportedTypes. This parameter can be set by passing the SupportedType data-type name as a string. See a list of supported types [here](https://sugarcoat.automatikarobotics.com/apidocs/ros_sugar/ros_sugar.io.supported_types.html)
     :type msg_type: Union[type[supported_types.SupportedType], str]
     :param qos_profile: QoS profile for the topic
     :type qos_profile: QoSConfig
@@ -825,52 +1040,102 @@ def _get_topic_or_action(
     return Topic(**entity)
 
 
-def _get_np_coordinates(
-    pre_defined: List[Union[List, Tuple[np.ndarray, str]]],
-) -> List[Union[List, Tuple[np.ndarray, str]]]:
-    pre_defined_list = []
-    for item in pre_defined:
-        pre_defined_list.append((np.array(item[0]), item[1]))
-    return pre_defined_list
+def _to_position(
+    value: Optional[Union[List[float], Tuple[float, ...]]],
+) -> Optional[Tuple[float, float, float]]:
+    """Normalize a position into an ``(x, y, z)`` float tuple (or ``None``)."""
+    if value is None:
+        return None
+    coords = tuple(float(v) for v in value)
+    if len(coords) != 3:
+        raise ValueError(
+            f"PriorMemory position must have 3 coordinates (x, y, z), got {len(coords)}"
+        )
+    return coords
+
+
+@define(kw_only=True)
+class PriorMemory(BaseAttrs):
+    """A piece of prior knowledge used to seed a ``Memory`` layer at startup,
+    before any live data arrives on the layer's topic.
+
+    :param text: The memory text to store.
+    :type text: str
+    :param position: Optional world-frame ``(x, y, z)`` coordinates in
+        meters. If omitted, the memory is stored at the origin
+        ``(0.0, 0.0, 0.0)``.
+    :type position: Optional[tuple[float, float, float]]
+    :param timestamp: Optional POSIX timestamp in seconds to tag the
+        memory with. If omitted, the component's current time is used
+        when the memory is seeded.
+    :type timestamp: Optional[float]
+
+    Example of usage:
+    ```python
+    PriorMemory(text="charging dock", position=(1.5, 0.0, 0.0))
+    ```
+    """
+
+    text: str = field()
+    position: Optional[Tuple[float, float, float]] = field(
+        default=None, converter=_to_position
+    )
+    timestamp: Optional[float] = field(default=None)
+
+
+def _get_prior_memories(
+    value: List[Union["PriorMemory", Dict]],
+) -> List["PriorMemory"]:
+    """Converter to rebuild ``PriorMemory`` items from dicts."""
+    memories = []
+    for item in value:
+        if isinstance(item, PriorMemory):
+            memories.append(item)
+        elif isinstance(item, dict):
+            memories.append(PriorMemory(**item))
+        else:
+            raise TypeError(
+                "prior_memories items must be a PriorMemory or a dict, got "
+                f"{type(item).__name__}"
+            )
+    return memories
 
 
 @define(kw_only=True)
 class MemLayer(BaseAttrs):
-    """A MemLayer represents a single input layer for a ``Memory`` or
-    ``MapEncoding`` component. It subscribes to a topic whose callback
-    produces a string representation (via ``_get_ui_content``) that can be
-    stored as an observation.
+    """A MemLayer represents a single input layer for a ``Memory`` component.
+    It subscribes to a topic whose callback produces a string representation
+    that is stored as an observation.
 
     :param subscribes_to: The topic that this layer is subscribed to.
     :type subscribes_to: Topic
-    :param temporal_change: Indicates whether the map should store changes over time for the same position. Defaults to False. (``MapEncoding`` only.)
-    :type temporal_change: bool
-    :param resolution_multiple: A positive multiplication factor for the base resolution of the map grid, for fine or coarse graining the map. Defaults to 1. (``MapEncoding`` only.)
-    :type resolution_multiple: int
-    :param pre_defined: An optional list of pre-defined data points in the layer. Each datapoint is a tuple of [position, text], where position is a numpy array of coordinates.
-    :type pre_defined: list[tuple[np.ndarray, str]]
+    :param prior_memories: An optional list of PriorMemory entries
+        used to seed the layer with prior knowledge at startup, before any
+        live data arrives on the topic. Each entry carries the memory text,
+        an optional world-frame ``(x, y, z)`` position, and an optional
+        timestamp.
+    :type prior_memories: list[PriorMemory]
     :param is_internal_state: If True, observations from this layer are
         treated as internal state (interoception) by ``Memory``: they are
         written via ``add_body_state`` and are retrieved through the
         ``body_status`` tool rather than the perception tools. Use this
         for robot-internal signals like battery, temperature, or joint
-        health. Defaults to False. (``Memory`` only.)
+        health. Defaults to False.
     :type is_internal_state: bool
 
     Example of usage:
     ```python
-    my_layer = MemLayer(subscribes_to='my_topic', temporal_change=True)
+    my_layer = MemLayer(
+        subscribes_to='my_topic',
+        prior_memories=[PriorMemory(text="entrance", position=(0.0, 0.0, 0.0))],
+    )
     battery_layer = MemLayer(subscribes_to='battery_state', is_internal_state=True)
     ```
     """
 
     subscribes_to: Topic = field(converter=_get_topic)
-    temporal_change: bool = field(default=False)
-    resolution_multiple: int = field(
-        default=1, validator=base_validators.in_range(min_value=0.1, max_value=10)
-    )
-    pre_defined: List[Union[List, Tuple[np.ndarray, str]]] = field(
-        default=Factory(list), converter=_get_np_coordinates
+    prior_memories: List[PriorMemory] = field(
+        default=Factory(list), converter=_get_prior_memories
     )
     is_internal_state: bool = field(default=False)
 
