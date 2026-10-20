@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Dict, Optional
 import os
 import cv2
 import numpy as np
@@ -17,7 +17,6 @@ from ros_sugar.io.utils import (
 )
 
 from .utils import (
-    create_detection_context,
     draw_detection_bounding_boxes,
     draw_points_2d,
 )
@@ -28,12 +27,30 @@ __all__ = ["GenericCallback", "TextCallback"]
 
 
 class StreamingStringCallback(TextCallback):
+    def __init__(self, input_topic, node_name: str = "") -> None:
+        super().__init__(input_topic, node_name)
+        # Full text of the current stream, accumulated across chunks
+        self._stream_text: str = ""
+
+    def callback(self, msg) -> None:
+        # self.msg is still the previous message here unless the stream is new or
+        # completed
+        if getattr(self.msg, "done", True):
+            self._stream_text = ""
+        self._stream_text += msg.data
+        super().callback(msg)
+
+    def _get_ui_content(self, **_) -> Dict:
+        """Full text of the current stream, so latest-value readers never miss
+        coalesced chunks, and whether the stream is done."""
+        return {"data": self._stream_text, "done": self.msg.done}
+
     def _get_output(self, **_) -> Optional[str]:
         """Gets text.
         :rtype: str | None
         """
 
-        if not self.msg:
+        if self.msg is None:
             return None
 
         # return str if fixed str has been read
@@ -46,6 +63,44 @@ class StreamingStringCallback(TextCallback):
                     "StreamingString topics cannot render templated strings. Discarding template."
                 )
             return self.msg.data
+
+
+class DecisionCallback(GenericCallback):
+    """Decision Callback class for Decision msg"""
+
+    def __init__(self, input_topic, node_name: Optional[str] = None) -> None:
+        super().__init__(input_topic, node_name)
+        self.msg = input_topic.fixed if self._is_fixed else None
+
+    def _get_output(self, **_) -> Optional[str]:
+        """Gives the answer as text
+
+        :returns: The answer as text
+        :rtype: str
+        """
+        if self.msg is None:
+            return None
+        # a fixed input is already text
+        if isinstance(self.msg, str):
+            return self.msg
+        if self.msg.type == "noul":
+            answer = "yes" if self.msg.noul >= 0.5 else "no"
+            probability = max(self.msg.noul, 1.0 - self.msg.noul)
+        elif self.msg.type == "choice":
+            answer = self.msg.choice
+            probability = max(self.msg.probabilities, default=0.0)
+        else:
+            level = round(self.msg.score)
+            options = list(self.msg.options)
+            answer = (
+                options[level] if 0 <= level < len(options) else f"{self.msg.score:.2f}"
+            )
+            probability = max(self.msg.probabilities, default=0.0)
+        return f"{self.msg.id}: {answer} ({probability:.2f})"
+
+    def _get_ui_content(self, **_) -> str:
+        """Get UI content for Decision: the answer as text"""
+        return self._get_output() or ""
 
 
 class VideoCallback(GenericCallback):
@@ -61,7 +116,7 @@ class VideoCallback(GenericCallback):
         """
         super().__init__(input_topic, node_name)
         # fixed video needs to be a path to cv2 readable video
-        if hasattr(input_topic, "fixed"):
+        if self._is_fixed:
             if os.path.isfile(input_topic.fixed):
                 try:
                     # read all video frames
@@ -92,7 +147,7 @@ class VideoCallback(GenericCallback):
         :returns:   Video as nd_array
         :rtype:     np.ndarray
         """
-        if not self.msg:
+        if self.msg is None:
             return None
 
         # return np.ndarray if fixed video has been read
@@ -111,6 +166,13 @@ class VideoCallback(GenericCallback):
             video.append(read_compressed_image(img, self.compressed_encoding))
         return np.array(video)
 
+    def _get_ui_content(self, **_) -> str:
+        """Last frame of the video as a base64 JPEG, shown like an Image"""
+        video = self.get_output()
+        if video is None or not len(video):
+            return ""
+        return convert_img_to_jpeg_str(video[-1], self.node_name)
+
 
 class RGBDCallback(GenericCallback):
     """
@@ -126,19 +188,33 @@ class RGBDCallback(GenericCallback):
         super().__init__(input_topic, node_name)
         self.msg = None
         # fixed RGBD message cannot be read from a file
-        if hasattr(input_topic, "fixed"):
+        if self._is_fixed:
             get_logger(self.node_name).error(
                 "RGBD message cannot be read from a fixed file"
             )
 
-    def _get_output(self, get_depth=False, **_) -> Optional[np.ndarray]:
+    def _get_output(
+        self, get_depth=False, depth_only=False, **_
+    ) -> Optional[np.ndarray]:
         """
         Gets RGBD image as a numpy array.
-        :returns:   Image and Depth as nd_array
+        Returns the RGB part by default. With `get_depth`, returns RGB and
+        depth concatenated as (H, W, 4). With `depth_only`, returns just the
+        depth part as (H, W, 1).
+        :returns:   Image and/or Depth as nd_array
         :rtype:     np.ndarray
         """
-        if not self.msg or not self.msg.rgb:
+        if self.msg is None or not self.msg.rgb:
             return None
+
+        if depth_only:
+            if not self.msg.depth:
+                return None
+            if not getattr(self, "depth_encoding", None):
+                self.depth_encoding = process_encoding(self.msg.depth.encoding)
+            depth = image_pre_processing(self.msg.depth, *self.depth_encoding)
+            # Ensure depth has shape (H, W, 1)
+            return np.expand_dims(depth, axis=-1)
 
         # pre-process and reshape the RGB image
         if not getattr(self, "rgb_encoding", None):
@@ -175,7 +251,7 @@ class DetectionsMultiSourceCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        self.msg = input_topic.fixed if hasattr(input_topic, "fixed") else None
+        self.msg = input_topic.fixed if self._is_fixed else None
         self.encoding = None
 
     def _get_output(self, **_) -> Optional[str]:
@@ -186,27 +262,25 @@ class DetectionsMultiSourceCallback(GenericCallback):
         :returns:   Comma separated classnames
         :rtype:     str
         """
-        if not self.msg:
+        if self.msg is None:
             return None
-        # send fixed list of labels if it exists
-        if isinstance(self.msg, list):
-            return create_detection_context(self.msg)
-
-        # send labels from ROS message
-        label_list = [
-            label for detection in self.msg.detections for label in detection.labels
-        ]
-        detections_string = create_detection_context(label_list)
-        return detections_string
+        labels = (
+            self.msg
+            if isinstance(self.msg, list)  # a fixed input is already a list of labels
+            else [
+                label for detection in self.msg.detections for label in detection.labels
+            ]
+        )
+        return ", ".join(labels) if labels else None
 
     def _get_ui_content(self, **_) -> str:
         """Get UI content for the first Detections2D msg in Detections2DMultiSource: draw bounding boxes and labels on the image."""
-        if not self.msg:
+        if self.msg is None:
             return ""
 
-        # If msg is a list, return precomputed detection context
+        # a fixed input is already a list of labels
         if isinstance(self.msg, list):
-            return create_detection_context(self.msg)
+            return ", ".join(self.msg)
 
         detections = self.msg.detections
         if not detections:
@@ -256,7 +330,7 @@ class DetectionsCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        self.msg = input_topic.fixed if hasattr(input_topic, "fixed") else None
+        self.msg = input_topic.fixed if self._is_fixed else None
         self.encoding = None
 
     def _get_output(self, **_) -> Optional[str]:
@@ -267,26 +341,20 @@ class DetectionsCallback(GenericCallback):
         :returns:   Comma separated classnames
         :rtype:     str
         """
-        if not self.msg:
+        if self.msg is None:
             return None
-
-        # send fixed list of labels if it exists
-        if isinstance(self.msg, list):
-            return create_detection_context(self.msg)
-
-        # send labels from ROS message
-        label_list = list(self.msg.labels)
-        detections_string = create_detection_context(label_list)
-        return detections_string
+        # a fixed input is already a list of labels
+        labels = self.msg if isinstance(self.msg, list) else list(self.msg.labels)
+        return ", ".join(labels) if labels else None
 
     def _get_ui_content(self, **_) -> str:
         """Get UI content for Detections2D: draw bounding boxes and labels on the image."""
-        if not self.msg:
+        if self.msg is None:
             return ""
 
-        # If msg is a list, return precomputed detection context
+        # a fixed input is already a list of labels
         if isinstance(self.msg, list):
-            return create_detection_context(self.msg)
+            return ", ".join(self.msg)
 
         img = None
 
@@ -310,11 +378,28 @@ class DetectionsCallback(GenericCallback):
 
         # Extract bounding boxes and labels
         bounding_boxes = getattr(self.msg, "boxes", [])
-        labels = getattr(self.msg, "labels", [])
 
-        img = draw_detection_bounding_boxes(img, bounding_boxes, labels)
+        img = draw_detection_bounding_boxes(img, bounding_boxes, self._box_labels())
 
         return convert_img_to_jpeg_str(img, getattr(self, "node_name", "ui"))
+
+    def _box_labels(self) -> list:
+        """The text drawn on each box in the UI"""
+        return list(self.msg.labels)
+
+
+class TrackingsCallback(DetectionsCallback):
+    """
+    Callback class for Trackings msg. Like detections, its get method returns
+    the tracked labels; the UI also shows each box's track id
+    """
+
+    def _box_labels(self) -> list:
+        """Each tracked label with its track id"""
+        return [
+            f"{label} #{track_id}"
+            for label, track_id in zip(self.msg.labels, self.msg.ids)
+        ]
 
 
 class PointsOfInterestCallback(GenericCallback):
@@ -331,7 +416,7 @@ class PointsOfInterestCallback(GenericCallback):
         :type       input_topic:  str
         """
         super().__init__(input_topic, node_name)
-        self.msg = input_topic.fixed if hasattr(input_topic, "fixed") else None
+        self.msg = input_topic.fixed if self._is_fixed else None
         self.encoding = None
 
     def _get_output(self, **_) -> Optional[np.ndarray]:
@@ -342,7 +427,7 @@ class PointsOfInterestCallback(GenericCallback):
         :returns:   Comma separated classnames
         :rtype:     str
         """
-        if not self.msg:
+        if self.msg is None:
             return None
 
         # send fixed list of points if it exists
@@ -358,7 +443,7 @@ class PointsOfInterestCallback(GenericCallback):
     def _get_ui_content(self, **_) -> str:
         """Get UI content for PointsOfInterest: draw points on the image."""
 
-        if not self.msg:
+        if self.msg is None:
             return ""
 
         points = self.get_output()
@@ -403,12 +488,75 @@ class JointStateCallback(GenericCallback):
         :returns:   Joint states as dict
         :rtype:     dict
         """
-        if not self.msg:
+        if self.msg is None:
             return None
 
         return JointsData(
             joints_names=self.msg.name,
             positions=np.array(self.msg.position),
             velocities=np.array(self.msg.velocity),
-            efforts=np.array(self.msg.effort)
+            efforts=np.array(self.msg.effort),
         )
+
+    def _get_ui_content(self, **_) -> Dict:
+        """Positions under ``data``, the shape of Sugarcoat's JointState
+        payload, with the names, velocities and efforts"""
+        return {
+            "data": list(self.msg.position),
+            "names": list(self.msg.name),
+            "velocities": list(self.msg.velocity),
+            "efforts": list(self.msg.effort),
+        }
+
+
+class Detections3DCallback(GenericCallback):
+    """
+    Callback class for Detections3D msg
+
+    Its get method returns a context string of the detected classes, like the
+    2D detections callback, so the output can be used in prompts and stored as
+    semantic memory. Consumers that need the geometry ask for the message itself
+    with `get_msg=True`.
+    """
+
+    def __init__(self, input_topic, node_name: Optional[str] = None) -> None:
+        """
+        Constructs a new instance.
+
+        :param      input_topic:  Subscription topic
+        :type       input_topic:  str
+        """
+        super().__init__(input_topic, node_name)
+        self.msg = input_topic.fixed if self._is_fixed else None
+
+    def _get_output(self, get_msg: bool = False, **_) -> Optional[Any]:
+        """
+        Processes labels and returns a context string for prompt engineering,
+        or the message itself when the metric boxes are needed.
+
+        :param      get_msg:  Return the Detections3D message instead of a
+                              context string
+        :type       get_msg:  bool
+
+        :returns:   Comma separated classnames, or the Detections3D message
+        :rtype:     Optional[Union[str, Detections3D]]
+        """
+        if self.msg is None:
+            return None
+
+        if get_msg:
+            return self.msg
+
+        if not self.msg.labels:
+            return None
+        frame = self.msg.header.frame_id or "camera frame"
+        objects = ", ".join(
+            f"{label} at ({box.center.position.x:.2f}, {box.center.position.y:.2f}, "
+            f"{box.center.position.z:.2f})"
+            for label, box in zip(self.msg.labels, self.msg.boxes)
+        )
+        return f"In {frame}: {objects}"
+
+    def _get_ui_content(self, **_) -> str:
+        """Get UI content for Detections3D: what was found and how far away."""
+        return self._get_output() or "No objects detected"
