@@ -14,7 +14,7 @@ Some clients might need additional dependacies, which are provided in the follow
 
 * - **Generic**
   - [GenericHTTPClient](agents.clients.generic.GenericHTTPClient)
-  - A generic client for interacting with OpenAI-compatible APIs, including vLLM, ms-swift, lmdeploy, Google Gemini, etc. Supports both standard and streaming responses, and works with LLMS and multimodal LLMs. Designed to be compatible with any API following the OpenAI standard. Supports tool calling.
+  - A generic client for interacting with OpenAI-compatible APIs, including vLLM, ms-swift, lmdeploy, Google Gemini, etc. Supports both standard and streaming responses, and works with LLMS and multimodal LLMs. Designed to be compatible with any API following the OpenAI standard. Supports tool calling. It also supports asking typed questions of decision models through the TypeSafe-compatible /v1/systemone API, with [GenericDecisionModel](agents.models.md#classes).
 
 * - **RoboML**
   - [RoboMLHTTPClient](agents.clients.roboml.RoboMLHTTPClient)
@@ -31,12 +31,12 @@ Some clients might need additional dependacies, which are provided in the follow
 
 * - **Ollama**
   - [OllamaClient](agents.clients.ollama.OllamaClient)
-  - An HTTP client for interacting with ML models served on [Ollama](https://ollama.com). Supports LLMs/MLLMs and embedding models. It can be invoked with the generic [OllamaModel](agents.models.md#classes). Supports tool calling.
+  - An HTTP client for interacting with ML models served on [Ollama](https://ollama.com). Supports LLMs/MLLMs, embedding models and decision models. It can be invoked with the generic [OllamaModel](agents.models.md#classes). Supports tool calling.
     Requires `pip install ollama`.
 
 * - **LeRobot**
   - [LeRobotClient](agents.clients.lerobot.LeRobotClient)
-  - A GRPC based asynchronous client for vision-language-action (VLA) policies served on LeRobot Policy Server. Supports various robot action policies available in LeRobot package by HuggingFace. It can be invoked with the generic wrapper [LeRobotPolicy](agents.models.md#classes).
+  - A GRPC based asynchronous client for vision-language-action (VLA) policies served on LeRobot Policy Server. Supports all robot action policies servable by the LeRobot Async Policy Server (LeRobot >= 0.6.0), including SmolVLA, Pi0/Pi0.5, NVIDIA GR00T N1.7, ACT and Diffusion policies. It can be invoked with the generic wrapper [LeRobotPolicy](agents.models.md#classes).
     Requires grpc and torch (at least the CPU version):<br/>
     `pip install grpcio`<br/>
     `pip install torch --index-url https://download.pytorch.org/whl/cpu`

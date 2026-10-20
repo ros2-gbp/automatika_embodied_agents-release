@@ -14,7 +14,10 @@ A Component is the main execution unit in _EmbodiedAgents_ and in essence each c
   - Leverages multimodal LLMs (e.g., Llava) for understanding and processing both text and image data. Inherits all functionalities of the LLM component.
 
 * - **[VLA](agents.components.vla.md)**
-  - Provides an interface to utilize Vision Language Action (VLA) models for manipulation and control tasks. It can use VLA Policies (such as SmolVLA, Pi0 etc.) served with HuggingFace LeRobot Async Policy Server and publish them to common topic formats in MoveIt Servo and ROS2 Control.
+  - Provides an interface to utilize Vision Language Action (VLA) models for manipulation and control tasks. It can use VLA Policies (such as SmolVLA, Pi0/Pi0.5, NVIDIA GR00T N1.7 etc.) served with HuggingFace LeRobot Async Policy Server and publish them to common topic formats in MoveIt Servo and ROS2 Control.
+
+* - **[MoveIt](agents.components.moveit.md)**
+  - Provides classical, collision aware manipulation by driving a running [MoveIt 2](https://moveit.ai) `move_group` node. Plans and executes end-effector pose goals, joint goals, named targets from the robot's SRDF and straight-line Cartesian paths, and controls the gripper. Complements the VLA component, which learns manipulation skills, by providing planned and collision checked motion.
 
 * - **[SpeechToText](agents.components.speechtotext.md)**
   - Converts spoken audio into text using speech-to-text models (e.g., Whisper). Suitable for voice command recognition. It also implements small on-board models for Voice Activity Detection (VAD) and Wakeword recognition, using audio capture devices onboard the robot.
@@ -22,14 +25,14 @@ A Component is the main execution unit in _EmbodiedAgents_ and in essence each c
 * - **[TextToSpeech](agents.components.texttospeech.md)**
   - Synthesizes audio from text using TTS models (e.g., TransformersTTS). Output audio can be played using the robot's speakers or published to a topic. Implements `say(text)` and `stop_playback` functions to play/stop audio based on events from other components or the environment.
 
-* - **[MapEncoding](agents.components.map_encoding.md)** *(deprecated — use Memory)*
-  - Provides a spatio-temporal working memory by converting semantic outputs (e.g., from MLLMs or Vision) into a structured map representation. Uses robot localization data and output topics from other components to store information in a vector DB. **Deprecated:** use the [Memory](agents.components.memory.md) component instead.
-
 * - **[Memory](agents.components.memory.md)**
   - Provides a graph-based spatio-temporal memory primitive powered by eMEM. Encodes perception streams (e.g., VLM descriptions, detections) and interoception streams (internal body state) into a memory indexed by meaning, location, and time. Exposes structured retrieval tools (semantic, spatial, temporal, entity, episode) as component actions and supports episode-based consolidation with entity tracking.
 
 * - **[SemanticRouter](agents.components.semantic_router.md)**
-  - Routes information between topics based on semantic content and predefined routing rules. Uses a vector DB for semantic matching or an LLM for decision-making. This allows for creating complex graphs of components where a single input source can trigger different information processing pathways.
+  - Routes information between topics based on semantic content and predefined routing rules. Uses a vector DB for semantic matching, an LLM for decision-making, or a decision model that chooses the route in one forward pass. This allows for creating complex graphs of components where a single input source can trigger different information processing pathways.
+
+* - **[DecisionComponent](agents.components.decision.md)**
+  - Asks a decision model (served by a TypeSafe-compatible /v1/systemone API) typed questions about its inputs: yes/no, a choice among options, or a score on ordered levels, each answered in one forward pass with a probability for every option. Publishes each question's answers on its own topic as Decision messages, so events can act on them with thresholds.
 
 * - **[Vision](agents.components.vision.md)**
   - An essential component in all vision powered robots. Performs object detection and tracking on incoming images. Outputs object classes, bounding boxes, and confidence scores. It implements a low-latency small on-board classification model as well.
@@ -37,19 +40,21 @@ A Component is the main execution unit in _EmbodiedAgents_ and in essence each c
 * - **[Cortex](agents.components.cortex.md)**
   - An LLM-powered high level cognitive component that combines the roll of a long term task planner and executor and also serves as the system monitor. Receives high-level natural language goals, decomposes them into steps by inspecting available components, and executes them with per-step confirmation. Automatically discovers component actions and ROS entrypoints as callable tools.
 
-* - **[VideoMessageMaker](agents.components.imagestovideo.md)**
-  - This component generates ROS video messages from input image messages. A video message is a collection of image messages that have a perceivable motion. I.e. the primary task of this component is to make intentionality decisions about what sequence of consecutive images should be treated as one coherent temporal sequence. The chunking method used for selecting images for a video can be configured in component config. It can be useful in sending videos to ML models that take image sequences.
+* - **[MotionDetector](agents.components.motion_detection.md)**
+  - Detects motion from a stream of images or a stream of point clouds. Publishes the motion state on a Bool topic (useful as an event source for other components), video messages of coherent motion sequences (image inputs) or the coordinates of motion centers (point cloud inputs). Supports ego-motion handling through an optional odometry topic.
 ```
 """
 
 from .component_base import Component
 from .cortex import Cortex
+from .decision import DecisionComponent
 from .imagestovideo import VideoMessageMaker
+from .motion_detection import MotionDetector
 from .llm import LLM
-from .map_encoding import MapEncoding
 from .memory import Memory
 from .mllm import MLLM, VLM
 from .model_component import ModelComponent
+from .moveit import MoveIt
 from .semantic_router import SemanticRouter
 from .speechtotext import SpeechToText
 from .texttospeech import TextToSpeech
@@ -59,16 +64,18 @@ from .vla import VLA
 __all__ = [
     "Component",
     "Cortex",
+    "DecisionComponent",
     "ModelComponent",
-    "MapEncoding",
     "Memory",
     "MLLM",
     "VLM",
     "LLM",
     "VLA",
+    "MoveIt",
     "SpeechToText",
     "TextToSpeech",
     "Vision",
+    "MotionDetector",
     "VideoMessageMaker",
     "SemanticRouter",
 ]
