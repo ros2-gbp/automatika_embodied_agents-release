@@ -1,3 +1,26 @@
+## automatika_embodied_agents (jazzy) - 0.8.0-1
+
+The packages in the `automatika_embodied_agents` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release --rosdistro jazzy automatika_embodied_agents` on `Tue, 20 Oct 2026 13:28:43 -0000`
+
+The `automatika_embodied_agents` package was released.
+
+Version of package(s) in repository `automatika_embodied_agents`:
+
+- upstream repository: https://github.com/automatika-robotics/ros-agents.git
+- release repository: https://github.com/ros2-gbp/automatika_embodied_agents-release.git
+- rosdistro version: `0.7.4-1`
+- old version: `0.7.4-1`
+- new version: `0.8.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.3`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## automatika_embodied_agents (humble) - 0.8.0-1
 
 The packages in the `automatika_embodied_agents` repository were released into the `humble` distro by running `/usr/bin/bloom-release --rosdistro humble automatika_embodied_agents` on `Tue, 20 Oct 2026 13:26:32 -0000`
