@@ -22,6 +22,7 @@ from agents.components import (
 )
 from agents.config import (
     LLMConfig,
+    MLLMConfig,
     MemoryConfig,
     SemanticRouterConfig,
     TextToSpeechConfig,
@@ -93,6 +94,7 @@ mllm = MLLM(
     outputs=[query_answer],
     model_client=qwen_vl_client,
     trigger=mllm_query,
+    config=MLLMConfig(chat_history=True),
     component_name="visual_q_and_a",
 )
 mllm.set_component_prompt(
@@ -132,12 +134,12 @@ def introspection_validation(output: str) -> Optional[str]:
 introspector.add_publisher_preprocessor(introspection_answer, introspection_validation)
 
 
-### Memory (replaces MapEncoding) ###
+### Memory ###
 position = Topic(name="odom", msg_type="Odometry")
 
 memory = Memory(
     layers=[
-        MemLayer(subscribes_to=detections_topic, temporal_change=True),
+        MemLayer(subscribes_to=detections_topic),
         MemLayer(subscribes_to=introspection_answer),
     ],
     position=position,
