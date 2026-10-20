@@ -12,11 +12,13 @@ __all__ = [
     "VLMConfig",
     "CortexConfig",
     "VLAConfig",
+    "MoveItConfig",
     "SpeechToTextConfig",
     "TextToSpeechConfig",
     "SemanticRouterConfig",
-    "MapConfig",
+    "DecisionConfig",
     "MemoryConfig",
+    "MotionDetectorConfig",
     "VideoMessageMakerConfig",
     "VisionConfig",
 ]
@@ -65,15 +67,23 @@ class LLMConfig(ModelComponentConfig):
     :type n_results: int
     :param chat_history: Whether to include chat history in the LLM's prompt.
     :type chat_history: bool
-    :param history_reset_phrase: Phrase to reset chat history. Defaults to 'chat reset'
+    :param history_reset_phrase: Phrase to reset chat history. Matched without case and trailing punctuation. Defaults to 'chat reset'
     :type history_reset_phrase: str
-    :param history_size: Number of user messages to keep in chat history. Defaults to 10
+    :param history_size: Turns kept in the chat history. Trimmed back to this once a third over it. Defaults to 10
     :type history_size: int
+    :param history_budget: Token budget for the whole request (system prompt, tools, history, images). When exceeded, the oldest turns are dropped until the request is at 3/4 of the budget. Estimated at 4 characters per token and ``image_tokens`` per image. Applies together with ``history_size``; the smaller limit wins. Defaults to None, in which case it is set from the model's context length minus ``max_new_tokens`` if the client can report it (Ollama, local models). Otherwise no budget is applied.
+    :type history_budget: Optional[int]
+    :param history_images: Most recent turns whose images are sent. Older turns note their omitted images. Default is 1.
+    :type history_images: int
+    :param image_tokens: Tokens counted per image against ``history_budget``. Default is 1000.
+    :param history_compaction: What becomes of the turns dropped from the chat history. "drop" forgets them. "summarize" folds them into a summary kept at the start of the conversation, with one call on the model each time. Default is "drop".
+    :type history_compaction: Literal["drop", "summarize"]
+    :type image_tokens: int
     :param temperature: Temperature used for sampling tokens during generation.
         Default is 0.8 and must be greater than 0.0.
     :type temperature: float
     :param max_new_tokens: The maximum number of new tokens to generate.
-        Default is 100 and must be greater than 0.
+        Default is 512 and must be greater than 0.
     :type max_new_tokens: int
     :param stream: Publish the llm output as a stream of tokens, useful when sending llm output to a user facing client or to a TTS component. Cannot be used in conjunction with tool calling.
         Default is false
@@ -84,7 +94,7 @@ class LLMConfig(ModelComponentConfig):
     :param response_terminator: A string token marking that the end of a single response from the model. This token is only used in case of a persistent clients, such as a websocket client and when stream is set to True. It is not published. This value cannot be an empty string.
         Default is '<<Response Ended>>'
     :type response_terminator: str
-    :param strip_think_tokens: Whether to strip ``<think>...</think>`` blocks from model output. Reasoning models (e.g. Qwen3, DeepSeek-R1) emit these blocks which are useful for debugging but should typically not be forwarded to downstream components such as TTS or UI. Applies to both streaming and non-streaming output. Default is True.
+    :param strip_think_tokens: Whether to strip ``<think>...</think>`` blocks from model output. Reasoning models emit these blocks which are useful for debugging but should typically not be forwarded to downstream components such as TTS or UI. Applies to both streaming and non-streaming output. Default is True.
     :type strip_think_tokens: bool
     :param enable_local_model: Whether to enable a local LLM model via llama.cpp, allowing the component to run without a remote model client. Requires the ``llama-cpp-python`` package. Default is False.
     :type enable_local_model: bool
@@ -94,6 +104,8 @@ class LLMConfig(ModelComponentConfig):
     :type ncpu_local_model: int
     :param local_model_path: HuggingFace repository ID for a GGUF model (default: ``Qwen/Qwen3-0.6B-GGUF``), or a local path to a ``.gguf`` file. This parameter is only effective when ``enable_local_model`` is True.
     :type local_model_path: Optional[str]
+    :param local_model_options: Additional options for the local model, validated at load time against the ``llama_cpp.Llama`` signature (e.g. ``n_ctx``, ``n_batch``, ``flash_attn``, ``chat_format``). Reserved keys: ``filename`` selects the GGUF file when a repository ships several quantizations (e.g. ``"*q4_k_m*.gguf"``); for VLM components ``model_type`` additionally forces the VLM family (moondream, qwen_vl, minicpm, llava, llava16, nanollava) instead of detecting it from the model name. An unknown key raises an error listing the valid keys. Only effective when ``enable_local_model`` is True. Default is ``{}``.
+    :type local_model_options: Dict
 
     Example of usage:
     ```python
@@ -108,24 +120,35 @@ class LLMConfig(ModelComponentConfig):
 
     enable_rag: bool = field(default=False)
     collection_name: Optional[str] = field(default=None)
-    distance_func: Literal["l2", "ip", "cosine"] = field(default="l2")
+    distance_func: Literal["l2", "ip", "cosine"] = field(
+        default="l2", validator=base_validators.in_(["l2", "ip", "cosine"])
+    )
     n_results: int = field(default=1)
     add_metadata: bool = field(default=False)
     chat_history: bool = field(default=False)
     history_reset_phrase: str = field(default="chat reset")
-    history_size: int = field(
-        default=10, validator=base_validators.gt(4)
-    )  # number of user messages
+    history_size: int = field(default=10, validator=base_validators.gt(0))  # turns
+    history_budget: Optional[int] = field(
+        default=None, validator=validators.optional(base_validators.gt(0))
+    )
+    history_images: int = field(default=1, validator=base_validators.gt(0))
+    image_tokens: int = field(default=1000, validator=base_validators.gt(0))
+    history_compaction: Literal["drop", "summarize"] = field(
+        default="drop", validator=base_validators.in_(["drop", "summarize"])
+    )
     temperature: float = field(default=0.8, validator=base_validators.gt(0.0))
-    max_new_tokens: int = field(default=1000, validator=base_validators.gt(0))
+    max_new_tokens: int = field(default=512, validator=base_validators.gt(0))
     stream: bool = field(default=False)
     break_character: str = field(default=".")
     response_terminator: str = field(default="<<Response Ended>>")
     strip_think_tokens: bool = field(default=True)
     enable_local_model: bool = field(default=False)
-    device_local_model: Literal["cpu", "cuda"] = field(default="cuda")
+    device_local_model: Literal["cpu", "cuda"] = field(
+        default="cuda", validator=base_validators.in_(["cpu", "cuda"])
+    )
     ncpu_local_model: int = field(default=1)
     local_model_path: Optional[str] = field(default="Qwen/Qwen3-0.6B-GGUF")
+    local_model_options: Dict = field(default=Factory(dict))
     _system_prompt: Optional[str] = field(default=None, alias="_system_prompt")
     _component_prompt: Optional[Union[str, Path]] = field(
         default=None, alias="_component_prompt"
@@ -177,8 +200,11 @@ class CortexConfig(LLMConfig):
        the execution plan. RAG context from a vector DB is also available during
        this phase. Controlled by ``max_planning_steps``.
     2. **Execution** — Each planned step is executed sequentially. Before each
-       step, a brief LLM confirmation call decides: EXECUTE, SKIP, or ABORT,
-       based on the original plan and results so far. After a plan is fully
+       step that is not run as part of a routine, a brief LLM confirmation call
+       decides, by calling a tool, to execute it, skip it, abort the plan, or
+       wait for an action that is still running, based on the original plan and
+       results so far. A step that fails, or that gets no decision, ends the
+       batch and returns to the planner. After a plan is fully
        executed, Cortex feeds the results back to the planner and may produce
        a follow-up plan, repeating the plan-execute loop until the planner
        signals completion. Both the per-plan length and the number of
@@ -198,19 +224,53 @@ class CortexConfig(LLMConfig):
         actions executed for one task is therefore ``max_execution_steps²``.
         Default is 10.
     :type max_execution_steps: int
+    :param session_history: Earlier tasks the planner remembers, each as the task and a record of the calls run, their results and the outcome, so a follow-up task can refer to them. Trimmed like ``history_size``, and by ``history_budget``. Default is 0: every task starts fresh.
+    :type session_history: int
     :param confirmation_temperature: Temperature for the per-step confirmation LLM
         calls. Used for both the decision and resolving tool call arguments
         from prior step results. Default is 0.3.
     :type confirmation_temperature: float
     :param confirmation_max_tokens: Maximum tokens for confirmation responses.
         Must be large enough to accommodate a tool call with resolved arguments
-        when the LLM returns EXECUTE. Default is 500.
+        when the LLM returns the next step's own tool call. Default is 500.
     :type confirmation_max_tokens: int
+    :param monitoring_interval: Seconds between checks on running goals and
+        routines while a plan executes. Default is 2.0.
+    :type monitoring_interval: float
+    :param compile_routines: Run two or more consecutive compilable steps of
+        a plan, component actions, awaited action goals and waits whose
+        arguments are all known, or a lone awaited goal, as one routine hosted
+        by the Monitor, with no confirmation call between them.
+        When False every step is confirmed and run one at a time. Default is True.
+    :type compile_routines: bool
+    :param step_timeout: Seconds a compiled component action step may take
+        before its routine fails at it. Goal steps wait for their server.
+        Default is 60.0.
+    :type step_timeout: float
+    :param enable_events: Offer the planner the add_event, remove_event and
+        list_events tools, with the prompt guidance on standing instructions.
+        Off by default: the tools are the most complex Cortex has, and a small
+        planning model does better without them. Default is False.
+    :type enable_events: bool
+    :param enable_scratch_functions: Let the planner write its own actions and
+        event conditions as Python code, when nothing available does what a task
+        needs. A written function runs in the launcher process with its privileges and
+        can do anything Python can, so turn this on only for a planning model
+        and a deployment you trust to that degree (YOU HAVE BEEN WARNED).
+        Set ``max_new_tokens`` high depending on the length of functions you
+        expect to generate.
+        Default is False.
+    :type enable_scratch_functions: bool
+    :param scratch_notes: What the planner is told about the environment its
+        written functions run in, in plain words: the environment variables
+        holding credentials, what the machine can reach, what is installed etc.
+        Only used when ``enable_scratch_functions`` is on.
+    :type scratch_notes: str
     :param temperature: Temperature used for the planning LLM call.
         Default is 0.8 and must be greater than 0.0.
     :type temperature: float
     :param max_new_tokens: The maximum number of new tokens to generate during planning.
-        Default is 1000 (inherited from LLMConfig) and must be greater than 0.
+        Default is 1000 and must be greater than 0.
     :type max_new_tokens: int
     :param enable_rag: Enable Retrieval Augmented Generation to provide context
         during planning. Requires a ``db_client`` to be passed to the Cortex component.
@@ -240,11 +300,19 @@ class CortexConfig(LLMConfig):
 
     max_planning_steps: int = field(default=10, validator=base_validators.gt(0))
     max_execution_steps: int = field(default=10, validator=base_validators.gt(0))
+    session_history: int = field(default=0, validator=base_validators.gt(-1))
     confirmation_temperature: float = field(
         default=0.3, validator=base_validators.gt(0.0)
     )
     confirmation_max_tokens: int = field(default=500, validator=base_validators.gt(0))
     monitoring_interval: float = field(default=2.0, validator=base_validators.gt(0.0))
+    compile_routines: bool = field(default=True)
+    step_timeout: float = field(default=60.0, validator=base_validators.gt(0.0))
+    enable_events: bool = field(default=False)
+    # higher max tokens for the planner
+    max_new_tokens: int = field(default=1000, validator=base_validators.gt(0))
+    enable_scratch_functions: bool = field(default=False)
+    scratch_notes: str = field(default="")
 
     def _get_inference_params(self) -> Dict:
         """get_inference_params.
@@ -277,10 +345,18 @@ class MLLMConfig(LLMConfig):
     :type n_results: int
     :param chat_history: Whether to include chat history in the LLM's prompt.
     :type chat_history: bool
-    :param history_reset_phrase: Phrase to reset chat history. Defaults to 'chat reset'
+    :param history_reset_phrase: Phrase to reset chat history. Matched without case and trailing punctuation. Defaults to 'chat reset'
     :type history_reset_phrase: str
-    :param history_size: Number of user messages to keep in chat history. Defaults to 10
+    :param history_size: Turns kept in the chat history. Trimmed back to this once a third over it. Defaults to 10
     :type history_size: int
+    :param history_budget: Token budget for the whole request (system prompt, tools, history, images). When exceeded, the oldest turns are dropped until the request is at 3/4 of the budget. Estimated at 4 characters per token and ``image_tokens`` per image. Applies together with ``history_size``; the smaller limit wins. Defaults to None, in which case it is set from the model's context length minus ``max_new_tokens`` if the client can report it (Ollama, local models). Otherwise no budget is applied.
+    :type history_budget: Optional[int]
+    :param history_images: Most recent turns whose images are sent. Older turns note their omitted images. Default is 1.
+    :type history_images: int
+    :param image_tokens: Tokens counted per image against ``history_budget``. Default is 1000.
+    :param history_compaction: What becomes of the turns dropped from the chat history. "drop" forgets them. "summarize" folds them into a summary kept at the start of the conversation, with one call on the model each time. Default is "drop".
+    :type history_compaction: Literal["drop", "summarize"]
+    :type image_tokens: int
     :param temperature: Temperature used for sampling tokens during generation.
         Default is 0.8 and must be greater than 0.0.
     :type temperature: float
@@ -296,20 +372,34 @@ class MLLMConfig(LLMConfig):
     :param response_terminator: A string token marking that the end of a single response from the model. This token is only used in case of a persistent clients, such as a websocket client and when stream is set to True. It is not published. This value cannot be an empty string.
         Default is '<<Response Ended>>'
     :type response_terminator: str
-    :param strip_think_tokens: Whether to strip ``<think>...</think>`` blocks from model output. Reasoning models (e.g. Qwen3, DeepSeek-R1) emit these blocks which are useful for debugging but should typically not be forwarded to downstream components such as TTS or UI. Applies to both streaming and non-streaming output. Default is True.
+    :param strip_think_tokens: Whether to strip ``<think>...</think>`` blocks from model output. Reasoning models emit these blocks which are useful for debugging but should typically not be forwarded to downstream components such as TTS or UI. Applies to both streaming and non-streaming output. Default is True.
     :type strip_think_tokens: bool
      :param task: The specific task the VLM should perform. This can help tailor model behavior and is useful when the VLM being used with the component has been trained on specific tasks. For an example of such a model check out RoboBrain2 in models.
         Supported values are: "general", "pointing", "affordance", "trajectory", and "grounding".
         Default is None.
     :type task: Optional[Literal["general", "pointing", "affordance", "trajectory", "grounding"]]
-    :param enable_local_model: Whether to enable a local VLM via llama.cpp (Moondream2), allowing the component to run without a remote model client. Requires the ``llama-cpp-python`` package. Default is False.
+    :param enable_local_model: Whether to enable a local VLM via llama.cpp (Qwen3-VL by default), allowing the component to run without a remote model client. Requires the ``llama-cpp-python`` package. Default is False.
     :type enable_local_model: bool
     :param device_local_model: Device to run the local model on, either "cpu" or "cuda" (default: "cuda"). This parameter is only effective when ``enable_local_model`` is True.
     :type device_local_model: str
     :param ncpu_local_model: Number of CPU cores to allocate to the local model when using CPU (default: 1). This parameter is only effective when ``enable_local_model`` is True.
     :type ncpu_local_model: int
-    :param local_model_path: HuggingFace repository ID for a GGUF VLM model (default: ``ggml-org/moondream2-20250414-GGUF``). This parameter is only effective when ``enable_local_model`` is True.
+    :param local_model_path: HuggingFace repository ID for a GGUF VLM model (default: ``ggml-org/Qwen3-VL-2B-Instruct-GGUF``), a local directory with the GGUF and mmproj files, or a local path to a ``.gguf`` file. The VLM family (qwen_vl, gemma, moondream, minicpm, llava, llava16, nanollava) is detected from the model name. This parameter is only effective when ``enable_local_model`` is True.
     :type local_model_path: Optional[str]
+    :param detections_frame: Frame that 3D detections are published in, usually the frame the consumer plans in, e.g. "base_link". Boxes are axis aligned in this frame and it is chosen before they are measured, so it cannot be changed after the fact. Required when a Detections3D output topic is given. Only meaningful with the "grounding" or "affordance" task.
+    :type detections_frame: str
+    :param static_camera_tf: Whether the transform from the camera to `detections_frame` is fixed, which it is for a camera bolted to the robot. Set False for a camera that moves with a moving joint, so the transform keeps being looked up. Default is True.
+    :type static_camera_tf: bool
+    :param depth_scale: Multiplier from the depth image's units to millimeters, overriding what its encoding implies. Default is None, which derives it from the encoding.
+    :type depth_scale: Optional[float]
+    :param min_depth: Closest depth reading to treat as usable, in meters. Default is 0.05.
+    :type min_depth: float
+    :param max_depth: Furthest depth reading to treat as usable, in meters. Default is 5.0.
+    :type max_depth: float
+    :param max_depth_age: How far apart in time the color and depth frames may be before the pair is treated as mismatched, in seconds. Default is 0.2.
+    :type max_depth_age: float
+    :param min_depth_validity: Minimum fraction of usable depth pixels inside a detection's 2D box for its 3D box to be published, in [0, 1]. For a point cloud the same number counts the points that landed in the box per pixel, so a sparse LiDAR needs it lowered, down to 0 to keep every box the detector could place. Default is 0.1.
+    :type min_depth_validity: float
 
     Example of usage:
     ```python
@@ -324,8 +414,46 @@ class MLLMConfig(LLMConfig):
 
     task: Optional[
         Literal["general", "pointing", "affordance", "trajectory", "grounding"]
-    ] = field(default=None)
-    local_model_path: Optional[str] = field(default="ggml-org/moondream2-20250414-GGUF")
+    ] = field(
+        default=None,
+        validator=validators.optional(
+            base_validators.in_([
+                "general",
+                "pointing",
+                "affordance",
+                "trajectory",
+                "grounding",
+            ])
+        ),
+    )
+    local_model_path: Optional[str] = field(
+        default="ggml-org/Qwen3-VL-2B-Instruct-GGUF"
+    )
+    # NOTE: 3D lift fields, kept identical to VisionConfig
+    detections_frame: str = field(default="")
+    static_camera_tf: bool = field(default=True)
+    depth_scale: Optional[float] = field(default=None)
+    min_depth: float = field(default=0.05, validator=base_validators.gt(0.0))
+    max_depth: float = field(default=5.0, validator=base_validators.gt(0.0))
+    max_depth_age: float = field(default=0.2, validator=base_validators.gt(0.0))
+    min_depth_validity: float = field(
+        default=0.1, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
+    )
+    # serialized topics
+    _depth_topic: Optional[Topic] = field(
+        default=None, converter=_get_optional_topic, alias="_depth_topic"
+    )
+    _camera_info_topic: Optional[Topic] = field(
+        default=None, converter=_get_optional_topic, alias="_camera_info_topic"
+    )
+
+    @max_depth.validator
+    def _check_depth_range(self, _, value):
+        """A sensor cannot see further than it can see"""
+        if value <= self.min_depth:
+            raise ValueError(
+                f"max_depth ({value}) must be greater than min_depth ({self.min_depth})"
+            )
 
     @task.validator
     def _check_task(self, _, value):
@@ -338,13 +466,6 @@ class MLLMConfig(LLMConfig):
             raise ValueError(
                 f"Local VLM model only supports general VQA. "
                 f"Task '{value}' requires a remote model client."
-            )
-
-    def __attrs_post_init__(self):
-        """Validate cross-field constraints for local model"""
-        if self.enable_local_model and self.stream:
-            raise ValueError(
-                "stream cannot be set to True when enable_local_model is True in VLMConfig. Local VLM model does not support streaming."
             )
 
     def _get_inference_params(self) -> Dict:
@@ -372,7 +493,11 @@ class VLAConfig(ModelComponentConfig):
         (keys) to the actual joint names in the robot's URDF/ROS system (values).
     :type joint_names_map: Dict[str, str]
     :param camera_inputs_map: A mapping of camera names expected by the model (keys)
-        to the corresponding ROS topics (values).
+        to the corresponding ROS topics (values). A camera whose dataset feature is
+        single channel is treated as a depth camera and fetches depth frames from its
+        topic (a depth Image topic or the depth part of an RGBD topic). Depth cameras
+        require ``dataset_info_file`` to be set on the LeRobotPolicy, as the
+        auto-generated feature spec assumes 3-channel RGB for every camera.
     :type camera_inputs_map: Mapping[str, Union[Topic, Dict]]
     :param state_input_type: The type of state data to extract from the joint state inputs.
         Supported values are "positions", "velocities", "accelerations", and "efforts".
@@ -397,8 +522,32 @@ class VLAConfig(ModelComponentConfig):
         actions within safe bounds.
     :type robot_urdf_file: Optional[str]
     :param joint_limits: A manual dictionary of joint limits to be used if a URDF file
-        is not provided. Format should match parsed URDF limits.
+        is not provided. Format should match parsed URDF limits. When a URDF file is
+        also provided, entries in this dictionary override the URDF-derived limits for
+        those joints.
     :type joint_limits: Optional[Dict]
+    :param policy_action_units: The unit space of the policy's actions, used to
+        convert URDF-derived joint limits before capping. URDF `<limit>` values are
+        always radians (per the URDF spec); this option converts them into the unit
+        space of the policy's actions:
+        - `"radians"` (default) — use URDF values as-is. Correct only when the policy
+          outputs radians.
+        - `"degrees"` — convert lower/upper (and velocity) to degrees.
+        - `"normalized"` — the LeRobot SO-10x motor-unit convention: each joint's
+          [lower, upper] range is mapped to [-100, 100]; joints whose name contains
+          "gripper" or "jaw" are mapped to [0, 100]. Use this for policies trained on
+          LeRobot datasets with normalized motor positions.
+        Only applies to URDF-derived limits; the manual `joint_limits` dict is always
+        used verbatim.
+    :type policy_action_units: Literal["radians", "degrees", "normalized"]
+    :param aggregate_fn_name: The strategy used to merge actions when newly received
+        action chunks overlap timesteps already in the queue (chunks from consecutive
+        inferences overlap). Presets mirror the LeRobot client:
+        "latest_only" (new action wins), "weighted_average" (0.3 * old + 0.7 * new),
+        "average" (0.5 * old + 0.5 * new) and "conservative" (0.7 * old + 0.3 * new).
+        A custom callable set with `set_aggregation_function` on the component takes
+        precedence over this preset. Default is "latest_only".
+    :type aggregate_fn_name: Literal["latest_only", "weighted_average", "average", "conservative"]
 
     Example of usage:
     ```python
@@ -419,13 +568,29 @@ class VLAConfig(ModelComponentConfig):
     # TODO: One can make models that take multiple state input types.
     # This parameter would have to be revised in that case
     state_input_type: Literal["positions", "velocities", "accelerations", "efforts"] = (
-        field(default="positions")
+        field(
+            default="positions",
+            validator=base_validators.in_([
+                "positions",
+                "velocities",
+                "accelerations",
+                "efforts",
+            ]),
+        )
     )
     # TODO: One can make models that produce multiple action output types.
     # This parameter would have to be revised in that case
     action_output_type: Literal[
         "positions", "velocities", "accelerations", "efforts"
-    ] = field(default="positions")
+    ] = field(
+        default="positions",
+        validator=base_validators.in_([
+            "positions",
+            "velocities",
+            "accelerations",
+            "efforts",
+        ]),
+    )
     observation_sending_rate: float = field(
         default=10.0, validator=base_validators.in_range(min_value=1e-6, max_value=1e6)
     )
@@ -437,6 +602,21 @@ class VLAConfig(ModelComponentConfig):
     )  # seconds
     robot_urdf_file: Optional[str] = field(default=None)
     joint_limits: Optional[Dict] = field(default=None)
+    policy_action_units: Literal["radians", "degrees", "normalized"] = field(
+        default="radians",
+        validator=base_validators.in_(["radians", "degrees", "normalized"]),
+    )
+    aggregate_fn_name: Literal[
+        "latest_only", "weighted_average", "average", "conservative"
+    ] = field(
+        default="latest_only",
+        validator=base_validators.in_([
+            "latest_only",
+            "weighted_average",
+            "average",
+            "conservative",
+        ]),
+    )
     _termination_mode: Literal["timesteps", "keyboard", "event"] = field(
         default="timesteps", alias="_termination_mode"
     )
@@ -453,6 +633,203 @@ class VLAConfig(ModelComponentConfig):
 
     def _get_inference_params(self) -> Dict:
         return {}
+
+
+@define(kw_only=True)
+class MoveItConfig(BaseComponentConfig):
+    """
+    Configuration for the MoveIt manipulation component.
+
+    It defines which planning groups to command on a running MoveIt 2 `move_group`
+    node, how to plan (planner selection, effort, tolerances) and how the gripper
+    is controlled.
+
+    :param arm_group_name: Name of the SRDF planning group of the arm (e.g. "panda_arm"). Group names are defined in the robot's MoveIt (SRDF) configuration.
+    :type arm_group_name: str
+    :param gripper_group_name: Name of the SRDF planning group of the gripper (e.g. "hand"). Required for gripper control when `gripper_mode` is "move_group". Default is None.
+    :type gripper_group_name: Optional[str]
+    :param cartesian_group_name: Planning group used for Cartesian path requests (straight-line motions, including the descend/retreat steps of pick and place). Default is None, which uses `arm_group_name`. Setting a separate group lets an underactuated (e.g. 5-DOF) arm pair a position-only IK configuration on the arm group (for pose goals) with an orientation-tracking IK configuration on a twin group over the same chain. MoveIt's Cartesian interpolator validates the achieved orientation of every step against a fixed precision the request cannot override, which a position-only solver cannot meet.
+    :type cartesian_group_name: Optional[str]
+    :param oriented_group_name: Planning group for pose goals that carry an explicit orientation. Sampling orientation-constrained goals and tracking Cartesian interpolation steps place opposite demands on an IK solver, so underactuated arms may need a third IK profile here. Default is None, which falls back to `cartesian_group_name`, then `arm_group_name`.
+    :type oriented_group_name: Optional[str]
+    :param oriented_orientation_tolerance: Orientation tolerance in radians for pose goals that carry an explicit orientation. Kept tight because wrist slack moves the gripper jaws centimeters, while `goal_orientation_tolerance` stays wide for unoriented goals. Default is 0.15.
+    :type oriented_orientation_tolerance: float
+    :param grasp_orientation: End-effector attitude for pick goals without an orientation of their own, as a quaternion [x, y, z, w] in the pose reference frame. Derive it from a known-good grasp (e.g. FK over a demonstration pose). With approach_mode "side" it describes a grasp along +x and is rotated to the target's bearing, so one calibration serves every direction. Default is None (goals keep their own orientation, given or not).
+    :type grasp_orientation: Optional[List[float]]
+    :param end_effector_link: End-effector link that pose targets and Cartesian waypoints refer to. Empty (default) uses the planning group's default tip link.
+    :type end_effector_link: str
+    :param pose_reference_frame: Default reference frame for pose targets that carry an empty `header.frame_id`. Empty (default) uses move_group's planning frame.
+    :type pose_reference_frame: str
+    :param planning_pipeline: Planning pipeline to use (e.g. "ompl", "pilz_industrial_motion_planner"). Empty (default) uses move_group's default pipeline. Validated against the pipelines advertised by move_group at activation.
+    :type planning_pipeline: str
+    :param planner_id: Planner algorithm within the pipeline (e.g. "RRTConnect", "RRTstar" for OMPL). Empty (default) uses the pipeline's default planner. Validated against the planners advertised by move_group at activation.
+    :type planner_id: str
+    :param num_planning_attempts: Number of planning attempts before the best solution is returned. Default is 5.
+    :type num_planning_attempts: int
+    :param allowed_planning_time: Maximum planning time in seconds. Default is 5.0.
+    :type allowed_planning_time: float
+    :param max_velocity_scaling: Fraction of the joint velocity limits used when timing trajectories, in (0, 1]. Default is 0.1 — deliberately slow; increase once a setup is trusted.
+    :type max_velocity_scaling: float
+    :param max_acceleration_scaling: Fraction of the joint acceleration limits used when timing trajectories, in (0, 1]. Default is 0.1.
+    :type max_acceleration_scaling: float
+    :param goal_position_tolerance: Position tolerance in meters for pose targets. Default is 1e-3.
+    :type goal_position_tolerance: float
+    :param goal_orientation_tolerance: Orientation tolerance in radians for pose targets — a single value applied to all axes, or a list of 3 per-axis values (x, y, z). Relaxing a single axis (e.g. z to ~3.14) makes many poses reachable for underactuated (e.g. 5-DOF) arms. Default is 1e-2.
+    :type goal_orientation_tolerance: Union[float, List[float]]
+    :param goal_joint_tolerance: Position tolerance in radians for joint targets. Default is 1e-3.
+    :type goal_joint_tolerance: float
+    :param cartesian_max_step: End-effector interpolation step in meters for Cartesian paths. Default is 0.0025.
+    :type cartesian_max_step: float
+    :param cartesian_jump_threshold: Maximum allowed joint-space jump between consecutive Cartesian points (0.0 disables the check). Default is 0.0.
+    :type cartesian_jump_threshold: float
+    :param cartesian_avoid_collisions: Whether Cartesian paths must avoid collisions. Default is True.
+    :type cartesian_avoid_collisions: bool
+    :param cartesian_fraction_threshold: Minimum fraction of the requested Cartesian path that must be achievable for the goal to be executed, in [0, 1]. Default is 0.95.
+    :type cartesian_fraction_threshold: float
+    :param gripper_mode: How the gripper is controlled: "move_group" (default) sends named targets on `gripper_group_name`; "gripper_command" sends a control_msgs GripperCommand to `gripper_command_action`.
+    :type gripper_mode: Literal["move_group", "gripper_command"]
+    :param gripper_command_action: Action name of the gripper controller (e.g. "/gripper_controller/gripper_cmd"). Required when `gripper_mode` is "gripper_command".
+    :type gripper_command_action: str
+    :param gripper_open_target: SRDF named target used by `open_gripper` in "move_group" mode. Default is "open".
+    :type gripper_open_target: str
+    :param gripper_close_target: SRDF named target used by `close_gripper` in "move_group" mode. Default is "close".
+    :type gripper_close_target: str
+    :param gripper_open_position: Gripper position used by `open_gripper` in "gripper_command" mode. Default is 0.04.
+    :type gripper_open_position: float
+    :param gripper_close_position: Gripper position used by `close_gripper` in "gripper_command" mode. Default is 0.0.
+    :type gripper_close_position: float
+    :param gripper_max_effort: Maximum effort for GripperCommand goals (0.0 lets the controller decide). Default is 0.0.
+    :type gripper_max_effort: float
+    :param move_group_namespace: Namespace prefix of the move_group interfaces (e.g. "/my_robot" if the actions are at "/my_robot/move_action"). Default is "".
+    :type move_group_namespace: str
+    :param move_group_node_name: Name of the move_group node, used to fetch the SRDF (named targets) from its parameters. Default is "move_group".
+    :type move_group_node_name: str
+    :param srdf_file: Path or URL of a local SRDF file used as fallback for named targets when the SRDF cannot be fetched from move_group. Default is None.
+    :type srdf_file: Optional[str]
+    :param server_timeout: Time in seconds to wait for move_group's servers to become available. Default is 30.0.
+    :type server_timeout: float
+    :param execution_timeout: Maximum wall time in seconds for a single plan+execute goal. Default is 120.0.
+    :type execution_timeout: float
+    :param scene_update_mode: WHEN detected objects are pushed into the planning scene: "manual" (default) only on the `update_planning_scene` component action, "on_goal" additionally refreshes the scene right before each motion goal is planned, "continuous" keeps refreshing at `scene_update_rate` while detections arrive. Only effective when the component is given a Detections3D input topic. In every mode the scene freezes while an object is held. The first refresh after release reconciles the scene.
+    :type scene_update_mode: Literal["manual", "on_goal", "continuous"]
+    :param scene_update_rate: Scene refreshes per second in "continuous" mode. Default is 1.0.
+    :type scene_update_rate: float
+    :param scene_detection_labels: Detection labels allowed into the planning scene. Default is None, which admits every label.
+    :type scene_detection_labels: Optional[List[str]]
+    :param scene_object_ttl: Seconds a detection-sourced object stays in the scene after the detector stops reporting it, before a refresh removes it. Bridges detection dropouts without keeping ghost obstacles around. Default is 5.0.
+    :type scene_object_ttl: float
+    :param object_padding: Margin in meters added on every side of detected objects, for planning clearance around imperfectly measured geometry. Default is 0.0.
+    :type object_padding: float
+    :param min_object_thickness: Floor in meters for each extent of a detected object. Surfaces seen head-on are lifted with no measurable extent along the view axis, and a zero-thickness box is invisible to collision checking. Default is 0.01.
+    :type min_object_thickness: float
+    :param touch_links: Links allowed to stay in contact with an attached object, e.g. the gripper's links. Default is None, which resolves them from the robot SRDF at attach time.
+    :type touch_links: Optional[List[str]]
+    :param approach_clearance: Height in meters above a pick or place target at which the collision-aware approach motion ends and the straight-line descent begins; also the height objects are lifted or retreated to. Default is 0.1.
+    :type approach_clearance: float
+    :param approach_mode: Geometry of the pick approach. "above" (default) hovers over the target and descends vertically, correct for grippers that can point down at their grasp. "side" puts the pre-grasp BEHIND the target at grasp height, backed off horizontally along the base-to-target bearing, so the straight-line descent becomes a horizontal slide into the grasp and the lift goes straight up instead of back to the pre-grasp point. For grippers whose mouths must take the object horizontally, such as surface-height grasps on underactuated arms.
+    :type approach_mode: Literal["above", "side"]
+    :param target_match_radius: How far in meters a scene object may be from a pick goal's target_pose and still be taken as the intended target. Tighten for dense scenes, loosen for coarse target coordinates such as language-model guesses. Default is 0.2.
+    :type target_match_radius: float
+
+    Example of usage:
+    ```python
+    config = MoveItConfig(arm_group_name="panda_arm", gripper_group_name="hand")
+    ```
+    """
+
+    arm_group_name: str = field()
+    gripper_group_name: Optional[str] = field(default=None)
+    cartesian_group_name: Optional[str] = field(default=None)
+    oriented_group_name: Optional[str] = field(default=None)
+    oriented_orientation_tolerance: float = field(
+        default=0.15, validator=base_validators.gt(0.0)
+    )
+    grasp_orientation: Optional[List[float]] = field(default=None)
+    end_effector_link: str = field(default="")
+    pose_reference_frame: str = field(default="")
+    planning_pipeline: str = field(default="")
+    planner_id: str = field(default="")
+    num_planning_attempts: int = field(default=5, validator=base_validators.gt(0))
+    allowed_planning_time: float = field(default=5.0, validator=base_validators.gt(0.0))
+    max_velocity_scaling: float = field(
+        default=0.1, validator=base_validators.in_range(min_value=1e-3, max_value=1.0)
+    )
+    max_acceleration_scaling: float = field(
+        default=0.1, validator=base_validators.in_range(min_value=1e-3, max_value=1.0)
+    )
+    goal_position_tolerance: float = field(
+        default=1e-3, validator=base_validators.gt(0.0)
+    )
+    goal_orientation_tolerance: Union[float, List[float]] = field(default=1e-2)
+    goal_joint_tolerance: float = field(default=1e-3, validator=base_validators.gt(0.0))
+    cartesian_max_step: float = field(default=0.0025, validator=base_validators.gt(0.0))
+    cartesian_jump_threshold: float = field(default=0.0)
+    cartesian_avoid_collisions: bool = field(default=True)
+    cartesian_fraction_threshold: float = field(
+        default=0.95, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
+    )
+    gripper_mode: Literal["move_group", "gripper_command"] = field(
+        default="move_group",
+        validator=base_validators.in_(["move_group", "gripper_command"]),
+    )
+    gripper_command_action: str = field(default="")
+    gripper_open_target: str = field(default="open")
+    gripper_close_target: str = field(default="close")
+    gripper_open_position: float = field(default=0.04)
+    gripper_close_position: float = field(default=0.0)
+    gripper_max_effort: float = field(default=0.0)
+    move_group_namespace: str = field(default="")
+    move_group_node_name: str = field(default="move_group")
+    srdf_file: Optional[str] = field(default=None)
+    server_timeout: float = field(default=30.0, validator=base_validators.gt(0.0))
+    execution_timeout: float = field(default=120.0, validator=base_validators.gt(0.0))
+    scene_update_mode: Literal["manual", "on_goal", "continuous"] = field(
+        default="manual",
+        validator=base_validators.in_(["manual", "on_goal", "continuous"]),
+    )
+    scene_update_rate: float = field(default=1.0, validator=base_validators.gt(0.0))
+    scene_detection_labels: Optional[List[str]] = field(default=None)
+    scene_object_ttl: float = field(default=5.0, validator=base_validators.gt(0.0))
+    object_padding: float = field(
+        default=0.0, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
+    )
+    min_object_thickness: float = field(default=0.01, validator=base_validators.gt(0.0))
+    touch_links: Optional[List[str]] = field(default=None)
+    approach_clearance: float = field(default=0.1, validator=base_validators.gt(0.0))
+    approach_mode: Literal["above", "side"] = field(
+        default="above", validator=base_validators.in_(["above", "side"])
+    )
+    target_match_radius: float = field(default=0.2, validator=base_validators.gt(0.0))
+
+    @goal_orientation_tolerance.validator
+    def _check_orientation_tolerance(self, _, value):
+        """Orientation tolerance validator"""
+        if isinstance(value, (int, float)):
+            if value <= 0:
+                raise ValueError("goal_orientation_tolerance must be greater than 0")
+            return
+        if len(value) != 3 or any(v <= 0 for v in value):
+            raise ValueError(
+                "goal_orientation_tolerance must be a single positive value or "
+                "a list of 3 positive per-axis (x, y, z) values"
+            )
+
+    @grasp_orientation.validator
+    def _check_grasp_orientation(self, _, value):
+        """Grasp orientation validator"""
+        if value is not None and len(value) != 4:
+            raise ValueError("grasp_orientation must be a quaternion as [x, y, z, w]")
+
+    @gripper_command_action.validator
+    def _check_gripper_command_action(self, _, value):
+        """Gripper command action validator.
+
+        Defined on gripper_command_action (declared after gripper_mode)."""
+        if self.gripper_mode == "gripper_command" and not value:
+            raise ValueError(
+                "gripper_command_action must be set when gripper_mode is "
+                "'gripper_command' (e.g. '/gripper_controller/gripper_cmd')"
+            )
 
 
 @define(kw_only=True)
@@ -481,8 +858,22 @@ class VisionConfig(ModelComponentConfig):
        :type device_local_classifier: str
        :param ncpu_local_classifier: Number of CPU cores to allocate to the local classifier when using CPU (default: 1). This parameter is only effective when enable_local_classifier is set to True.
        :type ncpu_local_classifier: int
-       :param local_classifier_model_path: Path or URL to the ONNX model used by the local classifier (default: DEIM, Huang et al. CVPR 2025). Other models based on [DEIM](https://github.com/ShihuaHuang95/DEIM?tab=readme-ov-file#deim-d-fine) can be checked [here](https://github.com/automatika-robotics/embodied-agents/releases/tag/0.3.3). This parameter is only effective when enable_local_classifier is set to True.
+       :param local_classifier_model_path: Path or URL to the ONNX model used by the local classifier (default: DEIM, Huang et al. CVPR 2025). Other models based on [DEIM](https://github.com/ShihuaHuang95/DEIM?tab=readme-ov-file#deim-d-fine) can be checked [here](https://github.com/automatika-robotics/embodied-agents/releases/tag/0.3.3). A URL may end with ``#sha256=<hex>`` to verify the download, as the default does. This parameter is only effective when enable_local_classifier is set to True.
        :type local_classifier_model_path: str
+       :param detections_frame: Frame that 3D detections are published in, usually the frame the consumer plans in, e.g. "base_link". Boxes are axis aligned in this frame and it is chosen before they are measured, so it cannot be changed after the fact. Required when a Detections3D output topic is given.
+       :type detections_frame: str
+       :param static_camera_tf: Whether the transform from the camera to `detections_frame` is fixed, which it is for a camera bolted to the robot. Set False for a camera that moves with a moving joint, so the transform keeps being looked up. Default is True.
+       :type static_camera_tf: bool
+       :param depth_scale: Multiplier from the depth image's units to millimeters, overriding what its encoding implies. Default is None, which derives it from the encoding.
+       :type depth_scale: Optional[float]
+       :param min_depth: Closest depth reading to treat as usable, in meters. Default is 0.05.
+       :type min_depth: float
+       :param max_depth: Furthest depth reading to treat as usable, in meters. Default is 5.0.
+       :type max_depth: float
+       :param max_depth_age: How far apart in time the color and depth frames may be before the pair is treated as mismatched, in seconds. Only applies to depth arriving on its own topic, since an RGBD frame carries both halves together. Default is 0.2.
+       :type max_depth_age: float
+       :param min_depth_validity: Minimum fraction of usable depth pixels inside a detection's 2D box for its 3D box to be published, in [0, 1]. For a point cloud the same number counts the points that landed in the box per pixel, so a sparse LiDAR needs it lowered, down to 0 to keep every box the detector could place. Default is 0.1.
+       :type min_depth_validity: float
 
        Example of usage:
        ```python
@@ -500,11 +891,38 @@ class VisionConfig(ModelComponentConfig):
     input_height: int = field(default=640)
     input_width: int = field(default=640)
     dataset_labels: Optional[Dict] = field(default=None)
-    device_local_classifier: Literal["cpu", "cuda", "tensorrt"] = field(default="cuda")
+    device_local_classifier: Literal["cpu", "cuda", "tensorrt"] = field(
+        default="cuda", validator=base_validators.in_(["cpu", "cuda", "tensorrt"])
+    )
     ncpu_local_classifier: int = field(default=1)
     local_classifier_model_path: str = field(
-        default="https://github.com/automatika-robotics/embodied-agents/releases/download/0.3.3/deim_dfine_hgnetv2_n_coco_160e.onnx"
+        default="https://github.com/automatika-robotics/embodied-agents/releases/download/0.3.3/deim_dfine_hgnetv2_n_coco_160e.onnx#sha256=d9e5a4aecfc923faeaaab96262444a489b635310fb397f1de8ac9f743cdcde68"
     )
+    # NOTE: 3D lift fields, kept identical to MLLMConfig
+    detections_frame: str = field(default="")
+    static_camera_tf: bool = field(default=True)
+    depth_scale: Optional[float] = field(default=None)
+    min_depth: float = field(default=0.05, validator=base_validators.gt(0.0))
+    max_depth: float = field(default=5.0, validator=base_validators.gt(0.0))
+    max_depth_age: float = field(default=0.2, validator=base_validators.gt(0.0))
+    min_depth_validity: float = field(
+        default=0.1, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
+    )
+    # serialized topics
+    _depth_topic: Optional[Topic] = field(
+        default=None, converter=_get_optional_topic, alias="_depth_topic"
+    )
+    _camera_info_topic: Optional[Topic] = field(
+        default=None, converter=_get_optional_topic, alias="_camera_info_topic"
+    )
+
+    @max_depth.validator
+    def _check_depth_range(self, _, value):
+        """A sensor cannot see further than it can see"""
+        if value <= self.min_depth:
+            raise ValueError(
+                f"max_depth ({value}) must be greater than min_depth ({self.min_depth})"
+            )
 
     def _get_inference_params(self) -> Dict:
         """get_inference_params.
@@ -523,19 +941,23 @@ class TextToSpeechConfig(ModelComponentConfig):
 
     This class defines the configuration options for a Text-To-Speech component.
 
-    :param enable_local_model: Whether to enable a local TTS model via ``sherpa-onnx`` (Kokoro English by default), allowing the component to run without a remote model client. Requires the ``sherpa-onnx`` pip package. Default is False.
+    :param enable_local_model: Whether to enable a local TTS model via ``sherpa-onnx`` (Kyutai's Pocket TTS by default), allowing the component to run without a remote model client. Requires the ``sherpa-onnx`` pip package. Default is False.
     :type enable_local_model: bool
     :param device_local_model: Device to run the local model on, either "cpu" or "cuda" (default: "cuda"). This parameter is only effective when ``enable_local_model`` is True.
     :type device_local_model: str
     :param ncpu_local_model: Number of CPU cores to allocate to the local model when using CPU (default: 1). This parameter is only effective when ``enable_local_model`` is True.
     :type ncpu_local_model: int
-    :param local_model_path: HuggingFace repository ID for a sherpa-onnx compatible TTS model (default: ``csukuangfj/kokoro-en-v0_19``). For available models see https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html. This parameter is only effective when ``enable_local_model`` is True.
+    :param local_model_path: HuggingFace repository ID for a sherpa-onnx compatible TTS model (default: ``csukuangfj2/sherpa-onnx-pocket-tts-int8-2026-01-26``, Kyutai's Pocket TTS), or a path to a local directory containing an already-downloaded bundle. For available models see https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html. This parameter is only effective when ``enable_local_model`` is True.
     :type local_model_path: Optional[str]
+    :param speaker_id: Voice index used by multi-voice local models (e.g. Kokoro ships several voices; single-voice models ignore it). Only effective when ``enable_local_model`` is True. Default is 0.
+    :type speaker_id: int
+    :param local_model_options: Additional options for the local model, validated at load time against the fields of the detected sherpa-onnx model family (e.g. ``length_scale``, ``noise_scale`` (vits/matcha), ``lang`` (kokoro), ``voice_style`` (supertonic), ``guidance_scale`` (zipvoice)) and the top-level sherpa-onnx TTS options (``silence_scale``, ``max_num_sentences``, ``rule_fsts``, ``rule_fars``). Voice-prompted families (pocket, zipvoice) also accept generation options: ``voice`` (a wav file path for voice cloning, or a voice name shipped in the bundle — Pocket TTS bundles include several; defaults to the bundle's first voice), ``num_steps``, ``reference_text`` and ``max_reference_audio_len``. An unknown key raises an error listing the valid keys for the detected family. The reserved key ``model_type`` forces the model family instead of detecting it from the bundle contents. Only effective when ``enable_local_model`` is True. Default is ``{}``.
+    :type local_model_options: Dict
     :param play_on_device: Whether to play the audio on available audio device (default: False).
     :type play_on_device: bool
     :param device: Optional device id (int) for playing the audio. Only effective if play_on_device is True (default: None).
     :type device: int
-    :param stream_to_ip: If set, streams the audio to this IP address via UDP instead of playing locally. Requires `play_on_device` to be True.
+    :param stream_to_ip: If set, streams the audio to this IP address via UDP instead of playing locally. Requires `play_on_device` to be True. The stream is raw audio over UDP, unencrypted by design for low latency, so keep it on a trusted network.
     :type stream_to_ip: Optional[str]
     :param stream_to_port: The target port for UDP streaming. Must be set if `stream_to_ip` is set.
     :type stream_to_port: Optional[int]
@@ -545,7 +967,7 @@ class TextToSpeechConfig(ModelComponentConfig):
     :type block_size: int
     :param thread_shutdown_timeout: Timeout to shutdown a playback thread, if data is not received for more than a certain number of seconds. Only effective if play_on_device is True (default: 5 seconds).
     :type thread_shutdown_timeout: int
-    :param stream: Stram output when used with WebSocketClient. Useful when model output is large and broken into chunks by the server. (default: True).
+    :param stream: Stream output audio in chunks. With a WebSocketClient, chunks are streamed by the server; with a local model, audio chunks are yielded as the model synthesizes them (all sherpa-onnx families support this). Useful for playing audio while long text is still being synthesized. (default: True).
     :type stream: bool
 
     Example of usage for local playback:
@@ -565,9 +987,15 @@ class TextToSpeechConfig(ModelComponentConfig):
     """
 
     enable_local_model: bool = field(default=False)
-    device_local_model: Literal["cpu", "cuda"] = field(default="cuda")
+    device_local_model: Literal["cpu", "cuda"] = field(
+        default="cuda", validator=base_validators.in_(["cpu", "cuda"])
+    )
     ncpu_local_model: int = field(default=1)
-    local_model_path: Optional[str] = field(default="csukuangfj/kokoro-en-v0_19")
+    local_model_path: Optional[str] = field(
+        default="csukuangfj2/sherpa-onnx-pocket-tts-int8-2026-01-26"
+    )
+    speaker_id: int = field(default=0, validator=base_validators.gt(-1))
+    local_model_options: Dict = field(default=Factory(dict))
     play_on_device: bool = field(default=False)
     device: Optional[int] = field(default=None)
     stream_to_ip: Optional[str] = field(default=None)
@@ -620,14 +1048,16 @@ class SpeechToTextConfig(ModelComponentConfig):
     --
     Local Model
     --
-    :param enable_local_model: Whether to enable a local STT model via ``sherpa-onnx`` (Whisper tiny.en by default), allowing the component to run without a remote model client. Requires the ``sherpa-onnx`` pip package. Default is False.
+    :param enable_local_model: Whether to enable a local STT model via ``sherpa-onnx`` (NVIDIA Parakeet TDT 0.6B by default), allowing the component to run without a remote model client. Requires the ``sherpa-onnx`` pip package. Default is False.
     :type enable_local_model: bool
     :param device_local_model: Device to run the local model on, either "cpu" or "cuda" (default: "cuda"). This parameter is only effective when ``enable_local_model`` is True.
     :type device_local_model: str
     :param ncpu_local_model: Number of CPU cores to allocate to the local model when using CPU (default: 1). This parameter is only effective when ``enable_local_model`` is True.
     :type ncpu_local_model: int
-    :param local_model_path: HuggingFace repository ID for a sherpa-onnx compatible Whisper STT model (default: ``csukuangfj/sherpa-onnx-whisper-tiny.en``). For available models see https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html. This parameter is only effective when ``enable_local_model`` is True.
+    :param local_model_path: HuggingFace repository ID for a sherpa-onnx compatible STT model (default: ``csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8``, NVIDIA Parakeet TDT), or a path to a local directory containing an already downloaded model. For available models see https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html. This parameter is only effective when ``enable_local_model`` is True.
     :type local_model_path: Optional[str]
+    :param local_model_options: Additional options for the local model, validated at load time against the detected sherpa-onnx model family's loader signature (e.g. ``decoding_method``, ``hotwords_file``, ``hotwords_score`` for transducers; ``task`` for whisper; ``use_itn`` for sense_voice). An unknown key raises an error listing the valid keys for the detected family. The reserved key ``model_type`` forces the model family instead of detecting it from the bundle contents. Only effective when ``enable_local_model`` is True. Default is ``{}``.
+    :type local_model_options: Dict
 
     --
     Transcription
@@ -688,14 +1118,22 @@ class SpeechToTextConfig(ModelComponentConfig):
     --
     Wakeword Detection
     --
-    :param enable_wakeword: Enable detection of a wakeword phrase (e.g. 'Hey Jarvis').
-                            Requires `enable_vad` to be True.
+    :param enable_wakeword: Enable detection of a wake phrase before transcription.
+                            Requires `enable_vad` to be True and the
+                            ``sentencepiece`` package for encoding the phrase.
                             Defaults to False.
     :type enable_wakeword: bool
 
-    :param wakeword_threshold: Minimum confidence score to trigger wakeword detection.
-                               Only used if `enable_wakeword` is True.
-                               Defaults to 0.6.
+    :param wakeword_phrase: The wake phrase (or list of phrases) to detect,
+                            as plain text (e.g. 'hey jarvis', 'ok robot').
+                            Only used if `enable_wakeword` is True.
+                            Defaults to 'ok robot'.
+    :type wakeword_phrase: Union[str, List[str]]
+
+    :param wakeword_threshold: Keyword spotting trigger threshold (sherpa-onnx
+                               `keywords_threshold`). Lower values trigger more
+                               easily. Only used if `enable_wakeword` is True.
+                               Defaults to 0.25.
     :type wakeword_threshold: float
 
     :param device_wakeword: Device for Wakeword Detection ('cpu' or 'gpu').
@@ -724,22 +1162,19 @@ class SpeechToTextConfig(ModelComponentConfig):
     --
     Model Paths
     --
-    :param vad_model_path: Path or URL to VAD ONNX model.
-                           Defaults to the Silero VAD model URL.
+    :param vad_model_path: Path or URL to VAD ONNX model. A URL may end with
+                           ``#sha256=<hex>`` to verify the download, as the
+                           default does. Defaults to the Silero VAD model.
     :type vad_model_path: str
 
-    :param melspectrogram_model_path: Path or URL to melspectrogram model used in wakeword detection.
-                                      Defaults to openWakeWord model URL.
-    :type melspectrogram_model_path: str
-
-    :param embedding_model_path: Path or URL to audio embedding model for wakeword detection.
-                                 Defaults to openWakeWord model URL.
-    :type embedding_model_path: str
-
-    :param wakeword_model_path: Path or URL to wakeword ONNX model (e.g. 'Hey Jarvis').
-                                Defaults to a pretrained openWakeWord model.
-                                For custom models, see:
-                                https://github.com/dscripka/openWakeWord/blob/main/notebooks/automatic_model_training.ipynb
+    :param wakeword_model_path: Source of the sherpa-onnx keyword spotting bundle:
+                                a model archive URL (.tar.bz2/.tar.gz), a HuggingFace
+                                repository ID, or a local directory. Defaults to the
+                                official English zipformer KWS bundle (3.3M params)
+                                from the sherpa-onnx releases. For other languages
+                                see https://github.com/k2-fsa/sherpa-onnx/releases/tag/kws-models.
+                                An archive URL may end with ``#sha256=<hex>`` to
+                                verify the download, as the default does.
     :type wakeword_model_path: str
 
     --
@@ -765,11 +1200,14 @@ class SpeechToTextConfig(ModelComponentConfig):
     """
 
     enable_local_model: bool = field(default=False)
-    device_local_model: Literal["cpu", "cuda"] = field(default="cuda")
+    device_local_model: Literal["cpu", "cuda"] = field(
+        default="cuda", validator=base_validators.in_(["cpu", "cuda"])
+    )
     ncpu_local_model: int = field(default=1)
     local_model_path: Optional[str] = field(
-        default="csukuangfj/sherpa-onnx-whisper-tiny.en"
+        default="csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
     )
+    local_model_options: Dict = field(default=Factory(dict))
     initial_prompt: Optional[str] = field(default=None)
     language: Optional[str] = field(
         default="en",
@@ -783,28 +1221,27 @@ class SpeechToTextConfig(ModelComponentConfig):
         default=0.5, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
     )
     wakeword_threshold: float = field(
-        default=0.6, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
+        default=0.25, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
     )
+    wakeword_phrase: Union[str, List[str]] = field(default="ok robot")
     min_silence_duration_ms: int = field(default=500)
     speech_pad_ms: int = field(default=30)
     speech_buffer_max_len: int = field(default=30000)
     stream: bool = field(default=False)
     min_chunk_size: int = field(default=2000, validator=base_validators.gt(500))
-    device_vad: Literal["cpu", "cuda", "tensorrt"] = field(default="cpu")
-    device_wakeword: Literal["cpu", "cuda", "tensorrt"] = field(default="cpu")
+    device_vad: Literal["cpu", "cuda", "tensorrt"] = field(
+        default="cpu", validator=base_validators.in_(["cpu", "cuda", "tensorrt"])
+    )
+    device_wakeword: Literal["cpu", "cuda", "tensorrt"] = field(
+        default="cpu", validator=base_validators.in_(["cpu", "cuda", "tensorrt"])
+    )
     ncpu_vad: int = field(default=1)
     ncpu_wakeword: int = field(default=1)
     vad_model_path: str = field(
-        default="https://raw.githubusercontent.com/snakers4/silero-vad/refs/heads/master/src/silero_vad/data/silero_vad.onnx"
-    )
-    melspectrogram_model_path: str = field(
-        default="https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx"
-    )
-    embedding_model_path: str = field(
-        default="https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx"
+        default="https://raw.githubusercontent.com/snakers4/silero-vad/bfdc0193023f121ea5b3cc7b176dbed570a68a59/src/silero_vad/data/silero_vad.onnx#sha256=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
     )
     wakeword_model_path: str = field(
-        default="https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx"
+        default="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#sha256=f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
     )
     _sample_rate: int = field(default=16000, alias="_sample_rate")
     _block_size: int = field(default=1280, alias="_block_size")
@@ -843,31 +1280,6 @@ class SpeechToTextConfig(ModelComponentConfig):
             "word_timestamps": self._word_timestamps,
             "vad_filter": self._vad_filter,
         }
-
-
-@define(kw_only=True)
-class MapConfig(BaseComponentConfig):
-    """Configuration for a MapEncoding component.
-
-    :param map_name: The name of the map.
-    :type map_name: str
-    :param distance_func: The function used to calculate distance when retreiving information from the map collection. Can be one of "l2" (L2 distance), "ip" (Inner Product), or "cosine" (Cosine similarity). Default is "l2".
-    :type distance_func: str
-
-    Example of usage:
-    ```python
-    config = MapConfig(map_name="my_map", distance_func="ip")
-    ```
-    """
-
-    map_name: str = field()
-    distance_func: Literal["l2", "ip", "cosine"] = field(default="l2")
-    _position: Optional[Topic] = field(
-        default=None, converter=_get_optional_topic, alias="_position"
-    )
-    _map_topic: Optional[Topic] = field(
-        default=None, converter=_get_optional_topic, alias="_map_topic"
-    )
 
 
 @define(kw_only=True)
@@ -966,15 +1378,38 @@ class MemoryConfig(BaseComponentConfig):
 
 
 @define(kw_only=True)
+class DecisionConfig(ModelComponentConfig):
+    """Configuration parameters for a decision component.
+
+    Example of usage:
+    ```python
+    config = DecisionConfig(warmup=True)
+    ```
+    """
+
+    _questions: Dict[str, Dict] = field(default=Factory(dict), alias="_questions")
+    # State name -> "component_name.method_name"
+    _action_states: Dict[str, str] = field(
+        default=Factory(dict), alias="_action_states"
+    )
+
+    def _get_inference_params(self):
+        """A decision model takes no inference parameters"""
+        return {}
+
+
+@define(kw_only=True)
 class SemanticRouterConfig(ModelComponentConfig):
     """Configuration parameters for a semantic router component.
 
     :param router_name: The name of the router.
     :type router_name: str
-    :param distance_func: The function used to calculate distance from route samples in vectordb. Can be one of "l2" (L2 distance), "ip" (Inner Product), or "cosine" (Cosine similarity). Default is "l2".
+    :param distance_func: The function used to calculate distance from route samples in vectordb. Can be one of "l2" (L2 distance), "ip" (Inner Product), or "cosine" (Cosine similarity). Default is "l2". This parameter is only effective in vector mode (when the router is given a db client).
     :type distance_func: str
-    :param maximum_distance: The maximum distance threshold for routing. A value between 0.1 and 1.0. Defaults to 0.4
+    :param maximum_distance: The maximum distance threshold for routing. A value between 0.1 and 1.0. Beyond it, the input goes to the default route, if one is set. Defaults to 0.4. This parameter is only effective in vector mode (when the router is given a db client).
     :type maximum_distance: float
+    :param minimum_confidence: The confidence the decision model's choice needs for routing. A value between 0.0 and 1.0. Below it, the input goes to the default route, if one is set. Defaults to 0.3. This parameter is only effective in decision mode (when the router is given a model client with a decision model).
+    :type minimum_confidence: float
 
     Example of usage:
     ```python
@@ -985,9 +1420,14 @@ class SemanticRouterConfig(ModelComponentConfig):
     """
 
     router_name: str = field()
-    distance_func: Literal["l2", "ip", "cosine"] = field(default="l2")
+    distance_func: Literal["l2", "ip", "cosine"] = field(
+        default="l2", validator=base_validators.in_(["l2", "ip", "cosine"])
+    )
     maximum_distance: float = field(
         default=0.4, validator=base_validators.in_range(min_value=0.1, max_value=1.0)
+    )
+    minimum_confidence: float = field(
+        default=0.3, validator=base_validators.in_range(min_value=0.0, max_value=1.0)
     )
     _default_route: Optional[str] = field(default=None, alias="_default_route")
 
@@ -997,31 +1437,94 @@ class SemanticRouterConfig(ModelComponentConfig):
 
 
 @define(kw_only=True)
-class VideoMessageMakerConfig(BaseComponentConfig):
-    """Configuration parameters for a video message maker component.
+class MotionDetectorConfig(BaseComponentConfig):
+    """Configuration parameters for a motion detection component.
 
+    --
+    Common params
+    --
+    :param motion_stop_delay: Number of consecutive still inputs before declaring that motion has ended. Debounces flickery detections. Default is 8.
+    :type motion_stop_delay: int
+    :param publish_bool_on_change_only: Publish on Bool output topics only when the motion state changes, instead of on every processed input. Default is False.
+    :type publish_bool_on_change_only: bool
+    :param process_rate: Optional maximum processing rate in Hz. Inputs arriving faster are dropped. Default is None (process every input).
+    :type process_rate: Optional[float]
+    :param device: Device for point cloud voxelization, "cpu" or "cuda". "cuda" requires torch (an error with installation instructions is raised if it is missing); if torch has no available CUDA device, processing falls back to cpu with a warning. Default is "cpu".
+    :type device: str
+
+    --
+    Image input params
+    --
     :param min_video_frames: The minimum number of frames in a video segment. Default is 15, assuming a 0.5 second video at 30 fps.
     :type min_video_frames: int
     :param max_video_frames: The maximum number of frames in a video segment. Default is 600, assuming a 20 second video at 30 fps.
+    :param video_preroll_frames: Number of frames from just before a motion episode begins that open its video, so the video shows the scene before the event; the still frames of the ``motion_stop_delay`` debounce close it. 0 disables. Default is 5.
     :type max_video_frames: int
-    :param motion_estimation_func: The function used for motion estimation. Can be one of "frame_difference" or "optical_flow". Default is None.
+    :param motion_estimation_func: The function used for image motion estimation, one of "frame_difference" (blurred absolute difference) or "optical_flow" (Farneback). Default is "frame_difference".
     :type motion_estimation_func: Optional[str]
-    :param threshold: The threshold value for motion detection. A float between 0.1 and 5.0. Default is 0.3.
+    :param threshold: The threshold value for image motion detection. A float between 0.1 and 5.0. Default is 0.3.
     :type threshold: float
     :param flow_kwargs: Additional keyword arguments for the optical flow algorithm. Default is a dictionary with reasonable values.
+    :param image_scale: Factor by which image frames are downscaled before motion estimation, in (0, 1]; 1.0 processes full resolution. Default is 0.5.
+    :type image_scale: float
+    :param roi_ignore_polygon: Optional polygon of (x, y) pixel coordinates to ignore during image motion estimation (e.g. a visible robot arm). Default is None.
+    :type roi_ignore_polygon: Optional[List]
+    :param pause_on_ego_motion: When a position (odometry) topic is provided with image inputs, suppress motion detection while the robot itself is moving. Default is True.
+    :type pause_on_ego_motion: bool
+    :param ego_speed_threshold: Speed (m/s) above which the robot is considered moving for ``pause_on_ego_motion``. Default is 0.05.
+    :type ego_speed_threshold: float
+    :param ego_turn_threshold: Heading rate (rad/s) above which the robot is considered turning for ``pause_on_ego_motion``. A robot turning in place has no linear speed while the whole image sweeps past. Default is 0.1.
+    :type ego_turn_threshold: float
+
+    --
+    Point cloud input params
+    --
+    :param voxel_size: Edge length in meters of the voxel grid used for cloud differencing. Default is 0.15.
+    :type voxel_size: float
+    :param changed_voxel_threshold: Number of newly appearing voxels (relative to the accumulated occupancy history) that form spatially coherent clusters of at least ``min_cluster_size`` voxels, required to declare motion. Coherence filters out scattered appearances from sensor noise or people standing quasi-still. Default is 5.
+    :type changed_voxel_threshold: int
+    :param accumulation_window: Number of previous clouds accumulated into the occupancy history that new clouds are differenced against. A window makes detection robust to sparse and non-repetitive scan patterns (e.g. Livox lidars) where a single previous cloud does not cover the whole scene. Detection starts once the window is full. Default is 20 (i.e. 2 seconds of history for a 10 Hz sensor).
+    :type accumulation_window: int
+    :param min_cluster_size: Minimum number of newly appearing voxels in a spatially connected cluster for the cluster to count as motion evidence and produce a motion center. Default is 4.
+    :type min_cluster_size: int
+    :param max_clusters: Maximum number of motion centers published at a time (largest clusters first). Default is 5.
+    :type max_clusters: int
+    :param min_range: Minimum planar (xy) range in meters of cloud points considered. Default is 0.0.
+    :type min_range: float
+    :param max_range: Maximum planar (xy) range in meters of cloud points considered. Default is 20.0.
+    :type max_range: float
+    :param z_min: Minimum height of cloud points considered. Default is -1.0 (1 meter below the sensor).
+    :type z_min: float
+    :param z_max: Maximum height of cloud points considered. Default is 1.0 (1 meter above the sensor).
+    :type z_max: float
+    :param base_frame: The robot base frame used for ego-motion subtraction. The static transform from the cloud frame to this frame (the sensor mount) is looked up from TF automatically. Default is "base_link".
+    :type base_frame: str
 
     Example of usage:
     ```python
-    config = VideoMessageMakerConfig()
+    config = MotionDetectorConfig()
     # or
-    config = VideoMessageMakerConfig(min_video_frames=30, motion_estimation_func="optical_flow", threshold=0.5)
+    config = MotionDetectorConfig(min_video_frames=30, motion_estimation_func="optical_flow", threshold=0.5)
     ```
     """
 
+    motion_stop_delay: int = field(
+        default=8, validator=base_validators.in_range(min_value=0, max_value=1e3)
+    )
+    publish_bool_on_change_only: bool = field(default=False)
+    process_rate: Optional[float] = field(default=None)
+    device: Literal["cpu", "cuda"] = field(
+        default="cpu", validator=base_validators.in_(["cpu", "cuda"])
+    )
+
     min_video_frames: int = field(default=15)  # assuming 0.5 second video at 30 fps
+    video_preroll_frames: int = field(
+        default=5, validator=base_validators.in_range(min_value=0, max_value=1e3)
+    )
     max_video_frames: int = field(default=600)  # assuming 20 second video at 30 fps
-    motion_estimation_func: Optional[Literal["frame_difference", "optical_flow"]] = (
-        field(default=None)
+    motion_estimation_func: Literal["frame_difference", "optical_flow"] = field(
+        default="frame_difference",
+        validator=base_validators.in_(["frame_difference", "optical_flow"]),
     )
     threshold: float = field(
         default=0.3, validator=base_validators.in_range(min_value=0.1, max_value=5.0)
@@ -1038,3 +1541,43 @@ class VideoMessageMakerConfig(BaseComponentConfig):
         },
         validator=validate_kwargs_from_default,
     )
+    image_scale: float = field(
+        default=0.5, validator=base_validators.in_range(min_value=0.05, max_value=1.0)
+    )
+    roi_ignore_polygon: Optional[List] = field(default=None)
+    pause_on_ego_motion: bool = field(default=True)
+    ego_speed_threshold: float = field(
+        default=0.05, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+    ego_turn_threshold: float = field(
+        default=0.1, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+
+    voxel_size: float = field(
+        default=0.15, validator=base_validators.in_range(min_value=1e-3, max_value=1e3)
+    )
+    changed_voxel_threshold: int = field(
+        default=5, validator=base_validators.in_range(min_value=1, max_value=1e9)
+    )
+    accumulation_window: int = field(
+        default=20, validator=base_validators.in_range(min_value=1, max_value=1e3)
+    )
+    min_cluster_size: int = field(
+        default=4, validator=base_validators.in_range(min_value=1, max_value=1e9)
+    )
+    max_clusters: int = field(
+        default=5, validator=base_validators.in_range(min_value=1, max_value=1e3)
+    )
+    min_range: float = field(
+        default=0.0, validator=base_validators.in_range(min_value=0.0, max_value=1e3)
+    )
+    max_range: float = field(
+        default=20.0, validator=base_validators.in_range(min_value=1e-3, max_value=1e3)
+    )
+    z_min: float = field(default=-1.0)
+    z_max: float = field(default=1.0)
+    base_frame: str = field(default="base_link")
+
+
+# Backwards-compatible alias for the renamed config
+VideoMessageMakerConfig = MotionDetectorConfig
