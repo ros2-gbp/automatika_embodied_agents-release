@@ -1,5 +1,6 @@
 from io import BytesIO
-from typing import Dict, Union
+from typing import Dict, Union, get_args
+from urllib.parse import urlparse
 import time
 import pickle
 import threading
@@ -13,7 +14,12 @@ from .lerobot_transport.utils import (
 
 __all__ = ["LeRobotClient"]
 
-LEROBOT_MIN_VERSION = "0.4.2"
+LEROBOT_MIN_VERSION = "0.6.0"
+
+# Policy types accepted by the LeRobot Async Policy Server (its SUPPORTED_POLICIES).
+SERVER_SUPPORTED_POLICIES = list(
+    get_args(LeRobotPolicy.__annotations__["policy_type"])
+)
 
 
 class LeRobotClient(ModelClient):
@@ -29,6 +35,11 @@ class LeRobotClient(ModelClient):
         logging_level: str = "info",
         **kwargs,
     ):
+        # gRPC only takes a bare address, so a scheme is dropped with warning
+        given = host
+        if "://" in host:
+            parsed = urlparse(host)
+            host, port = parsed.hostname or host, parsed.port or port
         try:
             from .lerobot_transport import services_pb2, services_pb2_grpc
 
@@ -69,6 +80,11 @@ class LeRobotClient(ModelClient):
             **kwargs,
         )
 
+        if given != host:
+            self.logger.warning(
+                f"Ignoring the scheme in '{given}': LeRobotClient connects over "
+                f"plain gRPC, without TLS, to {host}:{port}"
+            )
         self.running = False
         self.lock = threading.Lock()
         self.latest_actions = []
@@ -106,6 +122,7 @@ class LeRobotClient(ModelClient):
             lerobot_features=self.model_init_params["features"],
             actions_per_chunk=self.model_init_params["actions_per_chunk"],
             device=self.model_init_params["device"],
+            rename_map=self.model_init_params.get("rename_map") or {},
         )
 
         try:
@@ -114,7 +131,7 @@ class LeRobotClient(ModelClient):
 
         except Exception as e:
             self.logger.error(
-                f"Failed to initialize model {self.model_init_params['checkpoint']} on LeRobot Policy Server, please ensure that the checkpoint name or path is correct. Received the following error: {e}"
+                f"Failed to initialize model {self.model_init_params['checkpoint']} on LeRobot Policy Server, please ensure that the checkpoint name or path is correct and that the policy type '{self.model_init_params['policy_type']}' is one supported by the server: {SERVER_SUPPORTED_POLICIES}. Received the following error: {e}"
             )
             raise
         self.logger.info(

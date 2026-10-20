@@ -1,6 +1,5 @@
 from typing import Optional, List, Dict, Callable, Literal
 import inspect
-from functools import partial, wraps
 import queue
 import threading
 import numpy as np
@@ -16,6 +15,8 @@ import time
 from ..ros import (
     Event,
     Action,
+    ActionPhase,
+    ActionReturnType,
     RGBD,
     Image,
     Topic,
@@ -25,12 +26,20 @@ from ..ros import (
     ComponentRunType,
     MutuallyExclusiveCallbackGroup,
     VisionLanguageAction,
+    ExternalProcessorType,
+    component_action,
     run_external_processor,
 )
+from ..callbacks import RGBDCallback
 from ..utils import validate_func_args, find_missing_values
 from ..utils.actions import (
+    AGGREGATE_FUNCTIONS,
+    OBSERVATION_PREFIX,
     JointsData,
+    _as_depth_frame,
+    resolve_feature_channels,
     parse_urdf_joints,
+    convert_joint_limits_units,
     check_joint_limits,
     cap_actions_with_limits,
     create_observation_spec,
@@ -41,7 +50,64 @@ from .model_component import ModelComponent
 
 
 class VLA(ModelComponent):
-    """Vision-Language-Agent (VLA) Component."""
+    """
+    This component utilizes Vision-Language-Action (VLA) policies served on the LeRobot Async Policy Server (e.g. SmolVLA, Pi0/Pi0.5, NVIDIA GR00T N1.7, ACT, Diffusion) for robot manipulation and control tasks.
+
+    The component runs as a ROS2 Action Server exposing the `<component_name>/manipulate_with_vla` action which takes a natural language task description as its goal. While a goal is active, the component continuously streams observations (mapped joint states and camera images) to the policy server at `observation_sending_rate` and publishes the received action chunks as joint commands at `action_sending_rate`. Overlapping action chunks from consecutive inferences are merged using the aggregation strategy set in the config (or a custom callable set with `set_aggregation_function`). Goal termination is configured with `set_termination_trigger` (after a number of timesteps, on a key press, or on an event).
+
+    :param inputs: The input topics for the VLA component.
+        This should be a list of Topic objects, containing exactly one JointState topic and at least one Image (or RGBD) topic. The camera topics should be mapped to the dataset camera names in `camera_inputs_map` of the config.
+    :type inputs: list[Topic]
+    :param outputs: The output topics for the VLA component.
+        This should be a list of Topic objects. JointState, JointTrajectory and JointJog types are handled automatically, covering common input formats for MoveIt Servo and ROS2 Control.
+    :type outputs: list[Topic]
+    :param model_client: The model client for the VLA component.
+        This must be an instance of LeRobotClient, connected to a running LeRobot Async Policy Server which serves the policy defined in a LeRobotPolicy model.
+    :type model_client: LeRobotClient
+    :param config: The configuration for the VLA component.
+        This should be an instance of VLAConfig. `joint_names_map` and `camera_inputs_map` are required to map the dataset feature names to the robot's joints and camera topics.
+    :type config: VLAConfig
+    :param component_name: The name of the VLA component.
+        This should be a string.
+    :type component_name: str
+
+    Example usage:
+    ```python
+    joint_states = Topic(name="joint_states", msg_type="JointState")
+    camera = Topic(name="camera/image_raw", msg_type="Image")
+    joint_cmd = Topic(name="joint_cmd", msg_type="JointState")
+
+    policy = LeRobotPolicy(
+        name="pick_policy",
+        checkpoint="my_hf_user/smolvla_finetuned",
+        policy_type="smolvla",
+        dataset_info_file="https://huggingface.co/datasets/my_hf_user/my_dataset/resolve/main/meta/info.json",
+    )
+    model_client = LeRobotClient(model=policy, host="127.0.0.1", port=8080)
+
+    config = VLAConfig(
+        joint_names_map={
+            "shoulder_pan.pos": "Rotation",
+            "elbow_flex.pos": "Elbow",
+        },
+        camera_inputs_map={"front": camera},
+        robot_urdf_file="./my_robot.urdf",
+    )
+    vla_component = VLA(
+        inputs=[joint_states, camera],
+        outputs=[joint_cmd],
+        model_client=model_client,
+        config=config,
+        component_name="vla",
+    )
+    vla_component.set_termination_trigger(mode="timesteps", max_timesteps=200)
+    ```
+
+    A task can then be sent to the running component as a ROS2 action goal, e.g. from the command line:
+    ```shell
+    ros2 action send_goal /vla/manipulate_with_vla automatika_embodied_agents/action/VisionLanguageAction "{task: 'pick up the orange'}"
+    ```
+    """
 
     @validate_func_args
     def __init__(
@@ -68,6 +134,10 @@ class VLA(ModelComponent):
         self._dataset_sorted_joint_names = None
         # Joint Limits
         self.robot_joints_limits = None
+        # Action values seen and capped by the limits while the unit-mismatch
+        # heuristic is still sampling
+        self._cap_actions_seen = 0
+        self._cap_actions_capped = 0
         # Make verifications on init, skip after serialization
         if hasattr(self.model_client, "_model"):
             self._verify_config(component_name)
@@ -123,6 +193,8 @@ class VLA(ModelComponent):
         self._last_executed_timestep_lock = threading.Lock()
         self._last_executed_timestep = -1
 
+        # the task of the goal that is running
+        self._current_task: Optional[str] = None
         # track task status
         self._task_completed = False
 
@@ -141,15 +213,26 @@ class VLA(ModelComponent):
                 "Could not find a topic of type JointState. VLA component needs at least one topic of type JointState as input."
             )
 
-        # Assign external aggregator function in case its provided
-        if agg_fun := self._external_processors.get("aggregator_function", None):
-            # Get the first element of the tuple and the only function in that list
-            self._aggregator_function = partial(
-                run_external_processor,
-                logger_name=self.node_name,
-                topic_name="aggregator_function",
-                processor=agg_fun[0][0],
-            )
+        # Record expected channels per camera from the dataset features.
+        # Single channel features are treated as depth cameras
+        features = self.model_client.model_init_params.get("features") or {}
+        self._camera_channels: Dict[str, int] = {}
+        for cam_key in self.config.camera_inputs_map:
+            feature = features.get(f"{OBSERVATION_PREFIX}.images.{cam_key}") or {}
+            channels = resolve_feature_channels(feature)
+            if channels not in (1, 3, 4):
+                self.get_logger().warning(
+                    f"Could not identify the channel dimension of camera "
+                    f"'{cam_key}' from its dataset feature (shape "
+                    f"{feature.get('shape')}, names {feature.get('names')}) — "
+                    "treating it as a 3-channel RGB camera. If it is a depth "
+                    "camera, fix its feature entry in the dataset's info.json."
+                )
+                channels = 3
+            self._camera_channels[cam_key] = channels
+
+        # Resolve the aggregation preset from config
+        self._aggregator_function = AGGREGATE_FUNCTIONS[self.config.aggregate_fn_name]
 
     def custom_on_deactivate(self):
         """Custom deactivation"""
@@ -208,16 +291,17 @@ class VLA(ModelComponent):
                     "A stop_event must be provided when setting the termination mode to `event`"
                 )
             get_logger(self.node_name).info(
-                f"Action will terminate on {stop_event.name} event or after {max_timesteps}"
+                f"Action will terminate on {stop_event} or after {max_timesteps} timesteps"
             )
             self.config._termination_timesteps = max_timesteps
             self._add_event_action_pair(stop_event, Action(self.signal_done))
 
-    def signal_done(self):
+    def signal_done(self) -> ActionReturnType:
         """Signals that the action is complete.
         Can be used as an action for signaled events"""
         self._task_completed = True
         self.get_logger().info("Action completion signaled")
+        return True, "Action completion signaled"
 
     def _on_key_press(self, key):
         """Callback for keyboard listener."""
@@ -241,8 +325,13 @@ class VLA(ModelComponent):
             self.model_client._model._features = create_observation_spec(
                 self.config.joint_names_map,
                 self.config.camera_inputs_map,
-                prefix="observation",
+                prefix=OBSERVATION_PREFIX,
                 image_shape=(480, 640, 3),
+            )
+            # Refresh the init params captured at client construction, so the
+            # auto-generated spec reaches the policy server.
+            self.model_client.model_init_params = (
+                self.model_client._model._get_init_params()
             )
             logger.warning(
                 "You have not provided a dataset file for the model. Feature specification are required for initializing the policy on LeRobot Policy Server. We are going to auto-generate a feature spec from `joint_names_map` and `camera_inputs_map` that you provided. Please make sure their keys correspond to the names of features and actions used when training the model. Policy init might fail."
@@ -288,7 +377,7 @@ class VLA(ModelComponent):
         # TODO:: Handle partially available image keys with error logging
         # Remove LeRobot specific prefix in case it has been added by the user
         self.config.camera_inputs_map = {
-            k.removeprefix("observation.images."): v
+            k.removeprefix(f"{OBSERVATION_PREFIX}.images."): v
             for k, v in self.config.camera_inputs_map.items()
         }
 
@@ -316,6 +405,20 @@ class VLA(ModelComponent):
                     f"Your 'joint_names_map' includes robot joint names not found in the URDF. "
                     f"Missing: {missing_in_urdf}. Available in URDF: {list(limits.keys())}"
                 )
+
+            # URDF <limit> values are radians; convert them into the unit
+            # space of the policy's actions if the config says so
+            limits = convert_joint_limits_units(limits, self.config.policy_action_units)
+            if self.config.policy_action_units == "radians":
+                logger.info(
+                    "URDF joint limits used as radians (policy_action_units='radians'). "
+                    "If your policy outputs normalized motor positions (e.g. LeRobot "
+                    "SO-100/101 datasets), set policy_action_units='normalized'."
+                )
+
+            # Manual config limits override URDF-derived ones per joint
+            if self.config.joint_limits:
+                limits = {**limits, **self.config.joint_limits}
             return limits
 
         # Fallback to config limits
@@ -332,6 +435,55 @@ class VLA(ModelComponent):
         latest_actions = self.model_client.receive_actions()
         if latest_actions:
             self._update_actions_queue(latest_actions)
+
+    def _aggregate(self, existing: np.ndarray, new: np.ndarray) -> np.ndarray:
+        """Aggregate two actions generated for the same timestep. Uses the custom
+        aggregation function if set, falling back to the latest action if it fails
+        or returns an invalid output.
+
+        :param existing: Action already in the queue
+        :type existing: np.ndarray
+        :param new: Newly received action for the same timestep
+        :type new: np.ndarray
+        :return: Aggregated action
+        :rtype: np.ndarray
+        """
+        # The custom aggregation function takes precedence over the config preset
+        agg_fun = self._external_processors.get("aggregator_function")
+        if not agg_fun:
+            return self._aggregator_function(existing, new)
+
+        try:
+            out = run_external_processor(
+                self.node_name,
+                "aggregator_function",
+                agg_fun[0][0],
+                {"x": existing, "y": new},
+                processor_type=ExternalProcessorType.FUNCTION,
+            )
+        except Exception as e:
+            self.log_once(
+                "aggregator_error",
+                f"Custom aggregation function failed: {e}. Using the latest action instead.",
+                level="error",
+            )
+            return new
+
+        if type(out) is not np.ndarray or out.shape != new.shape:
+            self.log_once(
+                "aggregator_output",
+                f"Custom aggregation function returned an invalid output, expected a numpy array of shape {new.shape}. Using the latest action instead.",
+                level="error",
+            )
+            return new
+        if self._dataset_action_dtype and out.dtype != self._dataset_action_dtype:
+            self.log_once(
+                "aggregator_dtype",
+                f"Custom aggregation function returned an array of dtype {out.dtype}, expected {self._dataset_action_dtype}. Using the latest action instead.",
+                level="error",
+            )
+            return new
+        return out
 
     def _update_actions_queue(
         self,
@@ -367,9 +519,7 @@ class VLA(ModelComponent):
                     existing_act = action_map[ts]
 
                     # Perform the aggregation on the array
-                    merged_array = self._aggregator_function(
-                        existing_act.action, new_act.action
-                    )
+                    merged_array = self._aggregate(existing_act.action, new_act.action)
 
                     # Update the existing action object
                     existing_act.action = merged_array
@@ -418,12 +568,22 @@ class VLA(ModelComponent):
         # Get images
         images = {}
         for key, value in self.config.camera_inputs_map.items():
-            img_out = self.callbacks[value["name"]].get_output(clear_last=True)
+            # Camera map values are dicts after config serialization and
+            # Topic objects when launched in-process
+            topic_name = value["name"] if isinstance(value, dict) else value.name
+            callback = self.callbacks[topic_name]
+            expects_depth = self._camera_channels.get(key) == 1
+            if expects_depth and isinstance(callback, RGBDCallback):
+                img_out = callback.get_output(depth_only=True)
+            else:
+                img_out = callback.get_output()
             if img_out is None:
                 self.get_logger().warning(
-                    f"Did not receive an image for topic: {value['name']}, not sending input for inference"
+                    f"Did not receive an image for topic: {topic_name}, not sending input for inference"
                 )
                 return
+            if expects_depth:
+                img_out = _as_depth_frame(img_out)
             images[key] = img_out
 
         # Combine state, images and task
@@ -447,10 +607,12 @@ class VLA(ModelComponent):
             else:
                 return
 
-        # Create publishing action
+        # Create publishing action. The point should be reached within one
+        # action tick
         action_data = JointsData(
             joints_names=self._dataset_sorted_joint_names
             or list(self.config.joint_names_map.values()),
+            duration=1 / self.config.action_sending_rate,
         )
 
         # Cap actions within limits
@@ -465,6 +627,32 @@ class VLA(ModelComponent):
             if self.robot_joints_limits
             else action_to_pub_data
         )
+
+        # NOTE: Unit mismatch heuristic: if most of the first 100 action values
+        # get capped, the limits are almost certainly in a different unit space
+        # than the policy's actions. Issue a warning once.
+        if self.robot_joints_limits and self._cap_actions_seen < 100:
+            self._cap_actions_seen += len(np.atleast_1d(safe_action))
+            self._cap_actions_capped += int(
+                np.sum(
+                    ~np.isclose(
+                        np.asarray(safe_action, dtype=np.float64),
+                        np.asarray(action_to_pub_data, dtype=np.float64),
+                    )
+                )
+            )
+            capped_frac = self._cap_actions_capped / self._cap_actions_seen
+            if self._cap_actions_seen >= 100 and capped_frac > 0.5:
+                self.log_once(
+                    "cap_mismatch",
+                    f"{capped_frac:.0%} of the first {self._cap_actions_seen} action "
+                    "values were capped by joint limits — this usually means the "
+                    "limits and the policy's actions are in different unit spaces. "
+                    "URDF limits are radians; if your policy outputs normalized "
+                    "motor positions (e.g. LeRobot SO-100/101 datasets), set "
+                    "policy_action_units='normalized' in VLAConfig or provide "
+                    "'joint_limits' manually in the policy's units.",
+                )
 
         # TODO: Add smoothing for bigger deltas between new action and currect state
 
@@ -509,6 +697,34 @@ class VLA(ModelComponent):
 
         # reset task status
         self._task_completed = False
+        self._current_task = None
+
+    @component_action(
+        description={
+            "type": "function",
+            "function": {
+                "name": "get_current_task",
+                "description": (
+                    "Get the task the VLA manipulation policy is carrying out right "
+                    "now. Fails when no goal is running."
+                ),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        active=True,
+        # Not used as an execution tool as no task running returns a failure
+        phase=ActionPhase.PLANNING,
+    )
+    def get_current_task(self) -> ActionReturnType:
+        """The task of the goal that is running, as the goal gave it.
+        Fails when no task is running.
+
+        :return: Whether a goal is running, with its task
+        :rtype: ActionReturnType
+        """
+        if not self._current_task:
+            return False, "No goal is running"
+        return True, self._current_task
 
     def set_aggregation_function(
         self, agg_fn: Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -538,34 +754,16 @@ class VLA(ModelComponent):
                 "Aggregation function must have exactly two parameters, both expected to be numpy arrays."
             )
 
-        # Closure for using external functions
-        def agg_closure(func: Callable[[np.ndarray, np.ndarray], np.ndarray]):
-            """Wrapper for aggregator function"""
+        # Wrap the function to be called with keyword arguments.
+        def _wrapper(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+            return agg_fn(x, y)
 
-            @wraps(func)
-            def _wrapper(*, x: np.ndarray, y: np.ndarray):
-                """_wrapper"""
-                out = func(x, y)
-                # Check if we have action dtype
-                # type check agg fn output, if incorrect, raise an error
-                if type(out) is not np.ndarray:
-                    raise TypeError(
-                        "Only numpy arrays are acceptable as outputs of aggregator functions."
-                    )
-                elif (
-                    self._dataset_action_dtype
-                    and out.dtype != self._dataset_action_dtype
-                ):
-                    raise TypeError(
-                        f"Only numpy arrays of dtype {self._dataset_action_dtype} are acceptable as outputs of aggregator functions."
-                    )
-
-            _wrapper.__name__ = func.__name__
-            return _wrapper
+        # The function name is used to name the socket in a multiprocess launch
+        _wrapper.__name__ = agg_fn.__name__
 
         self._external_processors["aggregator_function"] = (
-            [agg_closure(agg_fn)],
-            "aggregator_function",
+            [_wrapper],
+            ExternalProcessorType.FUNCTION,
         )
 
     def main_action_callback(self, goal_handle: VisionLanguageAction.Goal):
@@ -581,8 +779,14 @@ class VLA(ModelComponent):
         # Clear the action queue
         self._actions_received.queue.clear()
 
+        # Reset per-goal state at goal START
+        with self._last_executed_timestep_lock:
+            self._last_executed_timestep = -1
+        self._task_completed = False
+
         # Get request
         task: str = goal_handle.request.task
+        self._current_task = task
 
         # Setup feedback of the action
         task_feedback_msg = VisionLanguageAction.Feedback()
@@ -620,9 +824,9 @@ class VLA(ModelComponent):
             and _timeout < self.config.input_timeout
             and not goal_handle.is_cancel_requested
         ):
-            self.get_logger().warning(
+            self.log_once(
+                "missing_inputs",
                 f"Inputs topics {self.get_missing_inputs()} are not available, waiting to start executing actions...",
-                once=True,
             )
             _timeout += 1 / self.config.loop_rate
             time.sleep(1 / self.config.loop_rate)
@@ -631,8 +835,8 @@ class VLA(ModelComponent):
             self.get_logger().error(
                 "Inputs were not received within the specified timeout period, aborting action."
             )
-            self._action_cleanup()
             with self._main_goal_lock:
+                self._action_cleanup()
                 goal_handle.abort()
                 return task_result
 
@@ -641,9 +845,18 @@ class VLA(ModelComponent):
                 start_time = time.perf_counter()
                 # Check if goal is canceled
                 if not goal_handle.is_active or goal_handle.is_cancel_requested:
-                    self._action_cleanup()
-                    self.get_logger().info("Goal Canceled")
-                    return task_result
+                    with self._main_goal_lock:
+                        self._action_cleanup()
+                        if goal_handle.is_cancel_requested:
+                            goal_handle.canceled()
+                            self.get_logger().info("Goal canceled by client")
+                        else:
+                            # an inactive goal was already transitioned elsewhere
+                            # nothing to transition
+                            self.get_logger().info(
+                                "Goal already terminated (preempted by a new goal), stopping execution"
+                            )
+                        return task_result
 
                 # Get new observations from inputs
                 model_observations = self._create_input(task)
@@ -658,9 +871,12 @@ class VLA(ModelComponent):
                     # send input for inference
                     self.model_client.inference(model_observations)
                 else:
-                    self.get_logger().warning(
-                        "Could not prepare inference input, skipping this step..."
+                    self.log_once(
+                        "no_inference_input",
+                        "Could not prepare inference input, skipping this step...",
                     )
+                    # Retry as soon as possible
+                    time.sleep(0.001)  # but let the component's other threads run
                     continue
 
                 # Compute errors and publish feedback
@@ -694,6 +910,12 @@ class VLA(ModelComponent):
             with self._main_goal_lock:
                 self._action_cleanup()
                 goal_handle.succeed()
+        else:
+            # Loop exited without success (e.g. timestep cap exceeded in
+            # event/keyboard mode). Clean up and abort explicitly.
+            with self._main_goal_lock:
+                self._action_cleanup()
+                goal_handle.abort()
 
         return task_result
 
@@ -737,4 +959,8 @@ class VLA(ModelComponent):
     def _warmup(self):
         """Warm up and stat check"""
         # TODO: implement warmup
+        pass
+
+    def _handle_websocket_streaming(self):
+        """Not used -- VLA streams actions through the LeRobot client."""
         pass
